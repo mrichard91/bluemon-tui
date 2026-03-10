@@ -1,0 +1,98 @@
+prefix,name
+00001800,Generic Access
+00001801,Generic Attribute
+00001802,Immediate Alert
+00001803,Link Loss
+00001804,Tx Power
+00001805,Current Time
+00001806,Reference Time Update
+00001807,Next DST Change
+00001808,Glucose
+00001809,Health Thermometer
+0000180a,Device Information
+0000180d,Heart Rate
+0000180e,Phone Alert Status
+0000180f,Battery
+00001810,Blood Pressure
+00001811,Alert Notification
+00001812,Human Interface Device
+00001813,Scan Parameters
+00001814,Running Speed & Cadence
+00001815,Automation IO
+00001816,Cycling Speed & Cadence
+00001818,Cycling Power
+00001819,Location & Navigation
+0000181a,Environmental Sensing
+0000181b,Body Composition
+0000181c,User Data
+0000181d,Weight Scale
+0000181e,Bond Management
+0000181f,Continuous Glucose
+00001820,Internet Protocol Support
+00001821,Indoor Positioning
+00001822,Pulse Oximeter
+00001823,HTTP Proxy
+00001824,Transport Discovery
+00001825,Object Transfer
+00001826,Fitness Machine
+00001827,Mesh Provisioning
+00001828,Mesh Proxy
+00001829,Reconnection Configuration
+00001101,Serial Port
+00001103,Dialup Networking
+00001104,IrMC Sync
+00001105,OBEX Object Push
+00001106,OBEX File Transfer
+00001108,Headset
+0000110a,A2DP Source
+0000110b,A2DP Sink
+0000110c,AVRCP Target
+0000110d,Advanced Audio
+0000110e,AVRCP Controller
+00001112,Headset AG
+00001115,PAN PANU
+00001116,PAN NAP
+00001117,PAN GN
+00001118,Direct Printing
+00001119,Reference Printing
+0000111e,Handsfree
+0000111f,Handsfree AG
+00001124,HID
+0000112d,SIM Access
+0000112f,Phonebook Access (PCE)
+00001130,Phonebook Access (PSE)
+00001132,Message Access (MAS)
+00001133,Message Access (MNS)
+00001200,PnP Information
+00001203,Generic Audio
+0000184e,Audio Stream Control
+0000184f,Broadcast Audio Scan
+00001850,Published Audio Capabilities
+00001851,Basic Audio Profile
+00001852,Broadcast Audio Announcement
+00001853,Common Audio
+00001854,Hearing Access
+00001855,TMAS
+00001856,Public Broadcast Announcement
+d0611e78,Apple Continuity
+7905f431,Apple ANCS
+89d3502b,Apple Media Service
+9fa480e0,Apple AirDrop
+0000fd6f,Exposure Notification
+0000fe9f,Google Fast Pair
+0000fe2c,Google Nearby
+0000feaa,Eddystone
+0000fef5,Philips Hue
+0000fee7,Tencent IoT
+0000feab,Nokia Beacon
+0000fff0,Xiaomi Mi
+0000fee0,Xiaomi Mi Band
+cba20d00,SwitchBot
+0000ffd0,Tuya BLE
+0000fff9,FIDO2 / WebAuthn
+0000feed,Tile
+0000feec,Tile (alt)
+0000febe,Bose
+0000feea,Swirl Networks
+0000fff6,Matter / Thread
+0000fd6e,Microsoft Swift Pair

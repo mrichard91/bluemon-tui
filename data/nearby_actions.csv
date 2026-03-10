@@ -1,0 +1,13 @@
+action_id,name
+01,Setup New Device
+04,Setup Transfer
+05,Setup Proximity
+06,HomeKit Setup
+07,Repair
+08,Setup Connect
+09,WiFi Password
+0A,iOS Setup
+0B,Handoff
+0C,WiFi Join
+0D,Tethering
+0E,HomePod Setup

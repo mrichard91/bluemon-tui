@@ -1,0 +1,18 @@
+category_id,name
+1,Other
+2,Bridge
+3,Fan
+4,Garage
+5,Light
+6,Lock
+7,Outlet
+8,Switch
+9,Thermostat
+10,Sensor
+11,Door
+12,Window
+13,WindowCover
+14,ProgramSwitch
+17,IP Camera
+28,Sprinkler
+29,Faucet
