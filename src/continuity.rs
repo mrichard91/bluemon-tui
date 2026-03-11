@@ -429,3 +429,202 @@ fn nearby_action_name(action: u8) -> &'static str {
         _ => "Unknown",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ContinuityData::parse ────────────────────────────────────────────
+
+    #[test]
+    fn parse_ibeacon() {
+        // type=0x02, length=21, then 16-byte UUID + major(2) + minor(2) + power(1)
+        let mut data = vec![0x02, 21];
+        // UUID: all zeros
+        data.extend_from_slice(&[0x00; 16]);
+        // major=1, minor=2
+        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x02]);
+        // measured power = -59 (0xC5 as i8)
+        data.push(0xC5);
+        let parsed = ContinuityData::parse(&data).unwrap();
+        match parsed {
+            ContinuityData::IBeacon { major, minor, measured_power, .. } => {
+                assert_eq!(major, 1);
+                assert_eq!(minor, 2);
+                assert_eq!(measured_power, -59);
+            }
+            other => panic!("Expected IBeacon, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_airpods_type_07() {
+        // type=0x07, length=5, model=0x0220, battery=0x8A, case+charge=0x50, lid=0x01
+        let data = vec![0x07, 0x05, 0x02, 0x20, 0x8A, 0x50, 0x01];
+        let parsed = ContinuityData::parse(&data).unwrap();
+        match parsed {
+            ContinuityData::AirPods { device_model, battery_left, battery_right, lid_open, .. } => {
+                assert_eq!(device_model, 0x0220);
+                assert_eq!(battery_left, Some(8));
+                assert_eq!(battery_right, Some(10));
+                assert!(lid_open);
+            }
+            other => panic!("Expected AirPods, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_airdrop() {
+        let data = vec![0x05, 0x02, 0xAB, 0xCD];
+        let parsed = ContinuityData::parse(&data).unwrap();
+        match parsed {
+            ContinuityData::AirDrop { contact_hash } => {
+                assert_eq!(contact_hash, "ABCD");
+            }
+            other => panic!("Expected AirDrop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_handoff() {
+        let data = vec![0x0C, 0x04, 0x01, 0x23, 0xAA, 0xBB];
+        let parsed = ContinuityData::parse(&data).unwrap();
+        match parsed {
+            ContinuityData::Handoff { activity_type, payload_hash } => {
+                assert_eq!(activity_type, 0x0123);
+                assert_eq!(payload_hash, "AABB");
+            }
+            other => panic!("Expected Handoff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_nearby_info() {
+        // status_flags=0x06 → activity=2 (screen-on), wifi=true; version byte=0x53
+        let data = vec![0x0F, 0x02, 0x06, 0x53];
+        let parsed = ContinuityData::parse(&data).unwrap();
+        match parsed {
+            ContinuityData::NearbyInfo { activity_level, wifi_on, os_version_hint, device_model } => {
+                assert_eq!(activity_level, 2);
+                assert!(wifi_on);
+                assert_eq!(os_version_hint, 5);
+                assert_eq!(device_model, 3);
+            }
+            other => panic!("Expected NearbyInfo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_nearby_action() {
+        let data = vec![0x10, 0x02, 0x09, 0x01];
+        let parsed = ContinuityData::parse(&data).unwrap();
+        match parsed {
+            ContinuityData::NearbyAction { action_type, flags } => {
+                assert_eq!(action_type, 0x09);
+                assert_eq!(flags, 0x01);
+            }
+            other => panic!("Expected NearbyAction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_findmy() {
+        let data = vec![0x19, 0x01, 0x42];
+        let parsed = ContinuityData::parse(&data).unwrap();
+        match parsed {
+            ContinuityData::FindMy { status } => assert_eq!(status, 0x42),
+            other => panic!("Expected FindMy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_type() {
+        let data = vec![0xFF, 0x02, 0xAA, 0xBB];
+        let parsed = ContinuityData::parse(&data).unwrap();
+        match parsed {
+            ContinuityData::Unknown { type_byte, .. } => assert_eq!(type_byte, 0xFF),
+            other => panic!("Expected Unknown, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_too_short_returns_none() {
+        assert!(ContinuityData::parse(&[]).is_none());
+        assert!(ContinuityData::parse(&[0x07]).is_none());
+    }
+
+    // ── summary ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn summary_airdrop() {
+        let d = ContinuityData::AirDrop { contact_hash: "ABCD".into() };
+        assert_eq!(d.summary(), "AirDrop contact:ABCD");
+    }
+
+    #[test]
+    fn summary_findmy() {
+        let d = ContinuityData::FindMy { status: 0x01 };
+        assert!(d.summary().contains("FindMy"));
+    }
+
+    #[test]
+    fn summary_nearby_action() {
+        let d = ContinuityData::NearbyAction { action_type: 0x09, flags: 0x00 };
+        assert!(d.summary().contains("WiFi Password"));
+    }
+
+    // ── airpods_model_name ───────────────────────────────────────────────
+
+    #[test]
+    fn airpods_known_model() {
+        assert_eq!(airpods_model_name(0x0220), "AirPods");
+        assert_eq!(airpods_model_name(0x1420), "AirPods Pro 2");
+    }
+
+    #[test]
+    fn airpods_unknown_model() {
+        assert_eq!(airpods_model_name(0xFFFF), "AirPods/Beats");
+    }
+
+    // ── homekit_category_name ────────────────────────────────────────────
+
+    #[test]
+    fn homekit_known_categories() {
+        assert_eq!(homekit_category_name(5), "Light");
+        assert_eq!(homekit_category_name(6), "Lock");
+        assert_eq!(homekit_category_name(9), "Thermostat");
+    }
+
+    #[test]
+    fn homekit_unknown_category() {
+        assert_eq!(homekit_category_name(200), "Unknown");
+    }
+
+    // ── ibeacon_uuid_name ────────────────────────────────────────────────
+
+    #[test]
+    fn ibeacon_known_uuid() {
+        assert_eq!(
+            ibeacon_uuid_name("b9407f30-f5f8-466e-aff9-25556b57fe6d"),
+            Some("Estimote")
+        );
+    }
+
+    #[test]
+    fn ibeacon_unknown_uuid() {
+        assert_eq!(ibeacon_uuid_name("00000000-0000-0000-0000-000000000000"), None);
+    }
+
+    // ── nearby_action_name ───────────────────────────────────────────────
+
+    #[test]
+    fn nearby_action_known() {
+        assert_eq!(nearby_action_name(0x01), "Setup New Device");
+        assert_eq!(nearby_action_name(0x09), "WiFi Password");
+    }
+
+    #[test]
+    fn nearby_action_unknown() {
+        assert_eq!(nearby_action_name(0xFF), "Unknown");
+    }
+}

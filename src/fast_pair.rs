@@ -64,3 +64,40 @@ pub fn lookup_model(data: &[u8]) -> Option<String> {
         .find(|(id, _)| *id == model_id)
         .map(|(_, name)| name.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_pixel_buds() {
+        let data = [0x00, 0x00, 0x47]; // model ID 0x000047
+        assert_eq!(lookup_model(&data), Some("Pixel Buds".to_string()));
+    }
+
+    #[test]
+    fn lookup_galaxy_buds_pro() {
+        let data = [0x00, 0x01, 0x08]; // model ID 0x000108
+        assert_eq!(lookup_model(&data), Some("Galaxy Buds Pro".to_string()));
+    }
+
+    #[test]
+    fn lookup_unknown_model() {
+        let data = [0xFF, 0xFF, 0xFF];
+        assert_eq!(lookup_model(&data), None);
+    }
+
+    #[test]
+    fn lookup_short_data() {
+        assert_eq!(lookup_model(&[0x00, 0x00]), None);
+        assert_eq!(lookup_model(&[0x00]), None);
+        assert_eq!(lookup_model(&[]), None);
+    }
+
+    #[test]
+    fn lookup_extra_bytes_ignored() {
+        // Extra bytes after the 3-byte model ID should be ignored
+        let data = [0x00, 0x00, 0x47, 0xFF, 0xFF];
+        assert_eq!(lookup_model(&data), Some("Pixel Buds".to_string()));
+    }
+}

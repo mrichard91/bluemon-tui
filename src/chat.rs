@@ -667,7 +667,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Parse inline markdown: **bold** and `code`
+/// Parse inline markdown: **bold** and `code`.
 fn parse_inline(text: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut remaining = text;
@@ -732,4 +732,183 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: extract all raw text from a vec of Spans
+    fn spans_text(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn lines_text(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(|l| spans_text(&l.spans)).collect()
+    }
+
+    // ── render_markdown ──────────────────────────────────────────────────
+
+    #[test]
+    fn render_h1() {
+        let lines = render_markdown("# Title");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(spans_text(&lines[0].spans), "Title");
+    }
+
+    #[test]
+    fn render_h2() {
+        let lines = render_markdown("## Subtitle");
+        assert_eq!(spans_text(&lines[0].spans), "Subtitle");
+    }
+
+    #[test]
+    fn render_h3() {
+        let lines = render_markdown("### Section");
+        assert_eq!(spans_text(&lines[0].spans), "Section");
+    }
+
+    #[test]
+    fn render_bullet_list() {
+        let lines = render_markdown("- item one\n- item two");
+        assert_eq!(lines.len(), 2);
+        let text = lines_text(&lines);
+        assert!(text[0].contains("item one"));
+        assert!(text[1].contains("item two"));
+    }
+
+    #[test]
+    fn render_code_block() {
+        let md = "```\nlet x = 1;\n```";
+        let lines = render_markdown(md);
+        assert_eq!(lines.len(), 1); // only the code line, ``` delimiters are stripped
+        assert!(spans_text(&lines[0].spans).contains("let x = 1;"));
+    }
+
+    #[test]
+    fn render_table_row() {
+        let md = "| Name | Value |\n|---|---|\n| foo | bar |";
+        let lines = render_markdown(md);
+        // Header row + data row (separator skipped)
+        assert_eq!(lines.len(), 2);
+        let data_row = spans_text(&lines[1].spans);
+        assert!(data_row.contains("foo"));
+        assert!(data_row.contains("bar"));
+    }
+
+    #[test]
+    fn render_empty_line() {
+        let lines = render_markdown("before\n\nafter");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(spans_text(&lines[1].spans), "");
+    }
+
+    // ── parse_inline ─────────────────────────────────────────────────────
+
+    #[test]
+    fn inline_plain_text() {
+        let spans = parse_inline("hello world");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "hello world");
+    }
+
+    #[test]
+    fn inline_bold() {
+        let spans = parse_inline("this is **bold** text");
+        assert_eq!(spans_text(&spans), "this is bold text");
+        // The bold span should have BOLD modifier
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn inline_code() {
+        let spans = parse_inline("use `code` here");
+        assert_eq!(spans_text(&spans), "use code here");
+        // The code span should have green color
+        assert_eq!(spans[1].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn inline_mixed() {
+        let spans = parse_inline("**bold** and `code`");
+        assert_eq!(spans_text(&spans), "bold and code");
+    }
+
+    #[test]
+    fn inline_unclosed_bold() {
+        let spans = parse_inline("open **bold");
+        let text = spans_text(&spans);
+        assert!(text.contains("**"));
+        assert!(text.contains("bold"));
+    }
+
+    #[test]
+    fn inline_unclosed_code() {
+        let spans = parse_inline("open `code");
+        let text = spans_text(&spans);
+        assert!(text.contains("`"));
+        assert!(text.contains("code"));
+    }
+
+    // ── execute_readonly_sql ─────────────────────────────────────────────
+
+    #[test]
+    fn sql_valid_select() {
+        let tmp = std::env::temp_dir().join("bluemon_test_chat.db");
+        let tmp_path = tmp.to_str().unwrap();
+        let _conn = crate::db::open(tmp_path).unwrap();
+
+        let result = execute_readonly_sql(tmp_path, "SELECT COUNT(*) as cnt FROM devices");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["row_count"], 1);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn sql_rejects_non_select() {
+        let tmp = std::env::temp_dir().join("bluemon_test_chat_reject.db");
+        let tmp_path = tmp.to_str().unwrap();
+        let _conn = crate::db::open(tmp_path).unwrap();
+
+        let result = execute_readonly_sql(tmp_path, "DROP TABLE devices");
+        assert!(result.contains("error"));
+        assert!(result.contains("Only SELECT"));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn sql_malformed_query() {
+        let tmp = std::env::temp_dir().join("bluemon_test_chat_malformed.db");
+        let tmp_path = tmp.to_str().unwrap();
+        let _conn = crate::db::open(tmp_path).unwrap();
+
+        let result = execute_readonly_sql(tmp_path, "SELECT * FROM nonexistent_table");
+        assert!(result.contains("error"));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn sql_row_cap() {
+        let tmp = std::env::temp_dir().join("bluemon_test_chat_cap.db");
+        let tmp_path = tmp.to_str().unwrap();
+        let conn = crate::db::open(tmp_path).unwrap();
+
+        // Insert 210 devices
+        for i in 0..210 {
+            conn.execute(
+                "INSERT INTO devices (mac, device_type, first_seen, last_seen, sightings) VALUES (?1, 'unknown', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', 1)",
+                rusqlite::params![format!("MAC{i:04}")],
+            ).unwrap();
+        }
+        drop(conn);
+
+        let result = execute_readonly_sql(tmp_path, "SELECT * FROM devices");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["row_count"], 200); // capped at 200
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

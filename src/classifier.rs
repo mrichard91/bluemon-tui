@@ -623,3 +623,198 @@ pub fn compute_fingerprint(
     let hash = hasher.finish();
     format!("{:04X}", (hash & 0xFFFF) as u16)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── company_name ─────────────────────────────────────────────────────
+
+    #[test]
+    fn company_name_apple() {
+        assert_eq!(company_name(0x004C), Some("Apple"));
+    }
+
+    #[test]
+    fn company_name_samsung() {
+        assert_eq!(company_name(0x0075), Some("Samsung"));
+    }
+
+    #[test]
+    fn company_name_unknown() {
+        assert_eq!(company_name(0xFFFF), None);
+    }
+
+    // ── best_company_name ────────────────────────────────────────────────
+
+    #[test]
+    fn best_company_name_recognized() {
+        let mut mfr = HashMap::new();
+        mfr.insert(0x004C, vec![0x07, 0x00]);
+        assert_eq!(best_company_name(&mfr), Some("Apple".to_string()));
+    }
+
+    #[test]
+    fn best_company_name_unrecognized_hex() {
+        let mut mfr = HashMap::new();
+        mfr.insert(0xBEEF, vec![]);
+        assert_eq!(best_company_name(&mfr), Some("BT#BEEF".to_string()));
+    }
+
+    #[test]
+    fn best_company_name_empty() {
+        let mfr = HashMap::new();
+        assert_eq!(best_company_name(&mfr), None);
+    }
+
+    // ── is_randomized_mac ────────────────────────────────────────────────
+
+    #[test]
+    fn randomized_mac_true() {
+        // 0x5E → bit 1 set → locally administered
+        assert!(is_randomized_mac("5E:AA:BB:CC:DD:EE"));
+    }
+
+    #[test]
+    fn randomized_mac_false() {
+        // 0xAC → bit 1 not set → public (global) address
+        assert!(!is_randomized_mac("AC:DE:48:00:11:22"));
+    }
+
+    #[test]
+    fn randomized_mac_invalid() {
+        assert!(!is_randomized_mac(""));
+        assert!(!is_randomized_mac("ZZ:11:22:33:44:55"));
+    }
+
+    // ── compute_fingerprint ──────────────────────────────────────────────
+
+    #[test]
+    fn fingerprint_deterministic() {
+        let mut mfr = HashMap::new();
+        mfr.insert(0x004C, vec![0x07, 0x19]);
+        let uuids = vec!["0000180a-0000-1000-8000-00805f9b34fb".to_string()];
+        let fp1 = compute_fingerprint(Some("MyDevice"), &uuids, &mfr, Some(4));
+        let fp2 = compute_fingerprint(Some("MyDevice"), &uuids, &mfr, Some(4));
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_differs_for_different_inputs() {
+        let mfr = HashMap::new();
+        let fp1 = compute_fingerprint(Some("DeviceA"), &[], &mfr, None);
+        let fp2 = compute_fingerprint(Some("DeviceB"), &[], &mfr, None);
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_is_4_char_hex() {
+        let mfr = HashMap::new();
+        let fp = compute_fingerprint(None, &[], &mfr, None);
+        assert_eq!(fp.len(), 4);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── classify_apple_mfr_data ──────────────────────────────────────────
+
+    #[test]
+    fn apple_ibeacon() {
+        assert_eq!(classify_apple_mfr_data(&[0x02]), DeviceType::SmartHome);
+    }
+
+    #[test]
+    fn apple_airpods() {
+        assert_eq!(classify_apple_mfr_data(&[0x07]), DeviceType::Audio);
+    }
+
+    #[test]
+    fn apple_airplay() {
+        assert_eq!(classify_apple_mfr_data(&[0x09]), DeviceType::Speaker);
+    }
+
+    #[test]
+    fn apple_handoff() {
+        assert_eq!(classify_apple_mfr_data(&[0x0C]), DeviceType::Computer);
+    }
+
+    #[test]
+    fn apple_findmy() {
+        assert_eq!(classify_apple_mfr_data(&[0x19]), DeviceType::SmartHome);
+    }
+
+    #[test]
+    fn apple_default_phone() {
+        assert_eq!(classify_apple_mfr_data(&[0x10]), DeviceType::Phone);
+    }
+
+    #[test]
+    fn apple_empty_data() {
+        assert_eq!(classify_apple_mfr_data(&[]), DeviceType::Phone);
+    }
+
+    // ── classify_by_device_class ─────────────────────────────────────────
+
+    #[test]
+    fn device_class_computer() {
+        // Major class 1 = Computer (bits 12-8 = 0b00001)
+        assert_eq!(classify_by_device_class(0x100), Some(DeviceType::Computer));
+    }
+
+    #[test]
+    fn device_class_phone() {
+        // Major class 2 = Phone
+        assert_eq!(classify_by_device_class(0x200), Some(DeviceType::Phone));
+    }
+
+    #[test]
+    fn device_class_audio() {
+        // Major class 4 = Audio/Video
+        assert_eq!(classify_by_device_class(0x400), Some(DeviceType::Audio));
+    }
+
+    #[test]
+    fn device_class_unknown_major() {
+        // Major class 0 = Miscellaneous
+        assert_eq!(classify_by_device_class(0x000), None);
+    }
+
+    // ── classify_device priority ─────────────────────────────────────────
+
+    #[test]
+    fn classify_service_uuid_highest_priority() {
+        let mut mfr = HashMap::new();
+        mfr.insert(0x004C, vec![0x07]); // would classify as Audio via Apple
+        let uuids = vec!["0000180d-0000-1000-8000-00805f9b34fb".to_string()]; // Heart Rate → Wearable
+        let dt = classify_device(None, None, &uuids, &mfr, None);
+        assert_eq!(dt, DeviceType::Wearable); // UUID wins over manufacturer data
+    }
+
+    #[test]
+    fn classify_manufacturer_over_name() {
+        let mut mfr = HashMap::new();
+        mfr.insert(0x009E, vec![]); // Bose → Audio
+        let dt = classify_device(None, Some("TV Living Room"), &[], &mfr, None);
+        assert_eq!(dt, DeviceType::Audio); // Mfr data wins over name pattern "TV"
+    }
+
+    #[test]
+    fn classify_name_pattern() {
+        let mfr = HashMap::new();
+        let dt = classify_device(None, Some("Matt's AirPods"), &[], &mfr, None);
+        assert_eq!(dt, DeviceType::Audio);
+    }
+
+    #[test]
+    fn classify_vendor_fallback() {
+        let mfr = HashMap::new();
+        let dt = classify_device(Some("Tesla, Inc."), None, &[], &mfr, None);
+        assert_eq!(dt, DeviceType::Vehicle);
+    }
+
+    #[test]
+    fn classify_unknown_fallback() {
+        let mfr = HashMap::new();
+        let dt = classify_device(None, None, &[], &mfr, None);
+        assert_eq!(dt, DeviceType::Unknown);
+    }
+}

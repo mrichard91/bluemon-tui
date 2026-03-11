@@ -250,3 +250,110 @@ pub fn generate_template() -> String {
     out.push_str("\n[uuids]\n");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_toml ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_toml_valid() {
+        let toml = r#"
+[uuids]
+"0000ABCD" = "My Custom Service"
+"1234" = "Short UUID"
+"#;
+        let map = parse_toml(toml);
+        assert_eq!(map.get("0000abcd").unwrap(), "My Custom Service");
+        // 4-char short UUID gets padded to 8
+        assert_eq!(map.get("00001234").unwrap(), "Short UUID");
+    }
+
+    #[test]
+    fn parse_toml_empty() {
+        let map = parse_toml("");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_toml_invalid() {
+        let map = parse_toml("not valid toml {{{{");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_toml_missing_uuids_section() {
+        let toml = r#"
+[other]
+key = "value"
+"#;
+        let map = parse_toml(toml);
+        assert!(map.is_empty());
+    }
+
+    // ── resolve ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_full_uuid_with_dashes() {
+        let name = resolve("0000180a-0000-1000-8000-00805f9b34fb");
+        assert_eq!(name, Some("Device Information".to_string()));
+    }
+
+    #[test]
+    fn resolve_8char_prefix() {
+        let name = resolve("0000180a");
+        assert_eq!(name, Some("Device Information".to_string()));
+    }
+
+    #[test]
+    fn resolve_4char_short() {
+        let name = resolve("180a");
+        assert_eq!(name, Some("Device Information".to_string()));
+    }
+
+    #[test]
+    fn resolve_case_insensitive() {
+        assert_eq!(resolve("0000180A"), Some("Device Information".to_string()));
+        assert_eq!(resolve("180A"), Some("Device Information".to_string()));
+    }
+
+    #[test]
+    fn resolve_unknown() {
+        assert_eq!(resolve("00009999"), None);
+    }
+
+    // ── resolve_compact ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_compact_deduplicates() {
+        let uuids = vec![
+            "0000180a-0000-1000-8000-00805f9b34fb".to_string(),
+            "0000180a-0000-1000-8000-00805f9b34fb".to_string(),
+            "0000180f-0000-1000-8000-00805f9b34fb".to_string(),
+        ];
+        let result = resolve_compact(&uuids);
+        assert_eq!(result, "Device Information, Battery");
+    }
+
+    #[test]
+    fn resolve_compact_empty() {
+        assert_eq!(resolve_compact(&[]), "");
+    }
+
+    #[test]
+    fn resolve_compact_unknown_filtered() {
+        let uuids = vec!["00009999-0000-0000-0000-000000000000".to_string()];
+        assert_eq!(resolve_compact(&uuids), "");
+    }
+
+    // ── generate_template ────────────────────────────────────────────────
+
+    #[test]
+    fn generate_template_has_header_and_uuids() {
+        let template = generate_template();
+        assert!(template.contains("[uuids]"));
+        assert!(template.contains("# 0000180a = \"Device Information\""));
+        assert!(template.contains("# 0000180f = \"Battery\""));
+    }
+}

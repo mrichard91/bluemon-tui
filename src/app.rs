@@ -574,3 +574,235 @@ pub fn format_uptime(start: DateTime<Local>) -> String {
     let s = total_secs % 60;
     format!("{h}:{m:02}:{s:02}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner::ScanResult;
+    use chrono::Duration;
+    use std::collections::HashMap;
+
+    // ── estimate_distance ────────────────────────────────────────────────
+
+    #[test]
+    fn distance_default_ref_power() {
+        // No tx_power, no ibeacon → default -59 dBm ref
+        let d = estimate_distance(-59, None, None);
+        assert!((d - 1.0).abs() < 0.01, "At ref power, distance should be ~1m, got {d}");
+    }
+
+    #[test]
+    fn distance_custom_tx_power() {
+        // tx_power=0 → ref = 0 - 40 = -40; rssi=-40 → distance ~1m
+        let d = estimate_distance(-40, Some(0), None);
+        assert!((d - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn distance_ibeacon_takes_priority() {
+        // ibeacon_power should override tx_power
+        let d_ibeacon = estimate_distance(-70, Some(10), Some(-70));
+        assert!((d_ibeacon - 1.0).abs() < 0.01, "iBeacon power should be used as ref");
+    }
+
+    #[test]
+    fn distance_stronger_rssi_means_closer() {
+        let close = estimate_distance(-50, None, None);
+        let far = estimate_distance(-80, None, None);
+        assert!(close < far);
+    }
+
+    // ── format_distance ──────────────────────────────────────────────────
+
+    #[test]
+    fn format_distance_none_rssi() {
+        assert_eq!(format_distance(None, None, None), "?");
+    }
+
+    #[test]
+    fn format_distance_close() {
+        // RSSI very close to ref → <1m
+        assert_eq!(format_distance(Some(-55), None, None), "<1m");
+    }
+
+    #[test]
+    fn format_distance_medium() {
+        let s = format_distance(Some(-70), None, None);
+        assert!(s.starts_with('~'));
+        assert!(s.ends_with('m'));
+    }
+
+    #[test]
+    fn format_distance_far() {
+        let s = format_distance(Some(-95), None, None);
+        assert!(s.starts_with('~'));
+        assert!(s.ends_with('m'));
+    }
+
+    // ── format_uptime ────────────────────────────────────────────────────
+
+    #[test]
+    fn format_uptime_zero() {
+        let now = Local::now();
+        let s = format_uptime(now);
+        assert_eq!(s, "0:00:00");
+    }
+
+    #[test]
+    fn format_uptime_one_hour() {
+        let start = Local::now() - Duration::seconds(3661);
+        let s = format_uptime(start);
+        assert_eq!(s, "1:01:01");
+    }
+
+    // ── App::upsert_device ───────────────────────────────────────────────
+
+    fn make_scan_result(mac: &str) -> ScanResult {
+        ScanResult {
+            mac: mac.to_string(),
+            name: None,
+            rssi: Some(-65),
+            tx_power: None,
+            vendor: Some("TestVendor".into()),
+            device_type: DeviceType::Unknown,
+            service_uuids: vec![],
+            is_randomized: false,
+            manufacturer_data: HashMap::new(),
+            device_class: None,
+            fingerprint: "ABCD".to_string(),
+        }
+    }
+
+    #[test]
+    fn upsert_new_device() {
+        let mut app = App::new(":memory:".into());
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
+        assert!(app.devices.contains_key("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].sightings, 1);
+    }
+
+    #[test]
+    fn upsert_preserves_first_seen() {
+        let mut app = App::new(":memory:".into());
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
+        let first_seen = app.devices["AA:BB:CC:DD:EE:FF"].first_seen;
+
+        // Second upsert should not change first_seen
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].first_seen, first_seen);
+        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].sightings, 2);
+    }
+
+    #[test]
+    fn upsert_updates_name_when_some() {
+        let mut app = App::new(":memory:".into());
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
+        assert!(app.devices["AA:BB:CC:DD:EE:FF"].name.is_none());
+
+        let mut r = make_scan_result("AA:BB:CC:DD:EE:FF");
+        r.name = Some("MyDevice".into());
+        app.upsert_device(r);
+        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].name.as_deref(), Some("MyDevice"));
+    }
+
+    #[test]
+    fn upsert_does_not_clear_name_with_none() {
+        let mut app = App::new(":memory:".into());
+        let mut r = make_scan_result("AA:BB:CC:DD:EE:FF");
+        r.name = Some("MyDevice".into());
+        app.upsert_device(r);
+
+        // Second upsert with name=None should preserve existing name
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].name.as_deref(), Some("MyDevice"));
+    }
+
+    #[test]
+    fn upsert_tracks_fingerprint_groups() {
+        let mut app = App::new(":memory:".into());
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:01"));
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:02"));
+        // Both devices share fingerprint "ABCD"
+        let group = app.fingerprint_groups.get("ABCD").unwrap();
+        assert!(group.contains("AA:BB:CC:DD:EE:01"));
+        assert!(group.contains("AA:BB:CC:DD:EE:02"));
+    }
+
+    // ── rebuild_fingerprint_groups ───────────────────────────────────────
+
+    #[test]
+    fn rebuild_fingerprint_groups_from_devices() {
+        let mut app = App::new(":memory:".into());
+        let now = Local::now();
+        app.devices.insert("MAC1".into(), DeviceInfo {
+            mac: "MAC1".into(), name: None, rssi: None, tx_power: None,
+            vendor: None, device_type: DeviceType::Unknown, service_uuids: vec![],
+            sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
+            note: None, fingerprint: "FP01".into(), manufacturer_data: HashMap::new(),
+            continuity: None, gatt_info: None, fast_pair_model: None,
+        });
+        app.devices.insert("MAC2".into(), DeviceInfo {
+            mac: "MAC2".into(), name: None, rssi: None, tx_power: None,
+            vendor: None, device_type: DeviceType::Unknown, service_uuids: vec![],
+            sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
+            note: None, fingerprint: "FP01".into(), manufacturer_data: HashMap::new(),
+            continuity: None, gatt_info: None, fast_pair_model: None,
+        });
+        app.devices.insert("MAC3".into(), DeviceInfo {
+            mac: "MAC3".into(), name: None, rssi: None, tx_power: None,
+            vendor: None, device_type: DeviceType::Unknown, service_uuids: vec![],
+            sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
+            note: None, fingerprint: "".into(), manufacturer_data: HashMap::new(),
+            continuity: None, gatt_info: None, fast_pair_model: None,
+        });
+
+        app.rebuild_fingerprint_groups();
+
+        // MAC1 and MAC2 share FP01
+        let group = app.fingerprint_groups.get("FP01").unwrap();
+        assert_eq!(group.len(), 2);
+        // MAC3 has empty fingerprint → uses MAC as key
+        assert!(app.fingerprint_groups.get("MAC3").unwrap().contains("MAC3"));
+    }
+
+    // ── save_note / cancel_note ──────────────────────────────────────────
+
+    #[test]
+    fn save_note_attaches_to_device() {
+        let mut app = App::new(":memory:".into());
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
+
+        app.note_mode = true;
+        app.note_mac = "AA:BB:CC:DD:EE:FF".into();
+        app.note_input = "test note".into();
+        let mac = app.save_note();
+        assert_eq!(mac, Some("AA:BB:CC:DD:EE:FF".to_string()));
+        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].note.as_deref(), Some("test note"));
+        assert!(!app.note_mode);
+    }
+
+    #[test]
+    fn save_empty_note_clears() {
+        let mut app = App::new(":memory:".into());
+        app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
+        app.devices.get_mut("AA:BB:CC:DD:EE:FF").unwrap().note = Some("old".into());
+
+        app.note_mode = true;
+        app.note_mac = "AA:BB:CC:DD:EE:FF".into();
+        app.note_input = "".into();
+        app.save_note();
+        assert!(app.devices["AA:BB:CC:DD:EE:FF"].note.is_none());
+    }
+
+    #[test]
+    fn cancel_note_clears_state() {
+        let mut app = App::new(":memory:".into());
+        app.note_mode = true;
+        app.note_mac = "AA:BB:CC:DD:EE:FF".into();
+        app.note_input = "test".into();
+        app.cancel_note();
+        assert!(!app.note_mode);
+        assert!(app.note_input.is_empty());
+        assert!(app.note_mac.is_empty());
+    }
+}

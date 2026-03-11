@@ -332,3 +332,161 @@ pub fn update_note(conn: &Connection, mac: &str, note: &str) -> anyhow::Result<(
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gatt::GattDeviceInfo;
+
+    // ── open ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn open_creates_schema() {
+        let conn = open(":memory:").unwrap();
+        // Both tables should exist
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('devices', 'observations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn open_idempotent() {
+        // Opening twice on the same path should not fail
+        let conn = open(":memory:").unwrap();
+        // Re-run the same schema DDL (simulates a second open)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS devices (mac TEXT PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY);"
+        ).unwrap();
+    }
+
+    // ── write_cycle + load_devices round-trip ────────────────────────────
+
+    fn make_test_device(mac: &str) -> DeviceInfo {
+        DeviceInfo {
+            mac: mac.to_string(),
+            name: Some("TestDevice".into()),
+            rssi: Some(-65),
+            tx_power: Some(4),
+            vendor: Some("TestVendor".into()),
+            device_type: DeviceType::Audio,
+            service_uuids: vec!["0000180a".into(), "0000180f".into()],
+            sightings: 3,
+            first_seen: DateTime::parse_from_rfc3339("2025-06-15T14:30:00+00:00")
+                .unwrap()
+                .with_timezone(&Local),
+            last_seen: DateTime::parse_from_rfc3339("2025-06-15T15:00:00+00:00")
+                .unwrap()
+                .with_timezone(&Local),
+            is_randomized: true,
+            note: Some("test note".into()),
+            fingerprint: "A1B2".into(),
+            manufacturer_data: HashMap::new(),
+            continuity: None,
+            gatt_info: None,
+            fast_pair_model: Some("Pixel Buds".into()),
+        }
+    }
+
+    #[test]
+    fn write_and_load_round_trip() {
+        let conn = open(":memory:").unwrap();
+
+        let mut devices = HashMap::new();
+        devices.insert("AA:BB:CC:DD:EE:01".into(), make_test_device("AA:BB:CC:DD:EE:01"));
+
+        let observations = vec![PendingObs {
+            mac: "AA:BB:CC:DD:EE:01".into(),
+            rssi: Some(-65),
+            name: Some("TestDevice".into()),
+            service_uuids: "0000180a,0000180f".into(),
+        }];
+
+        write_cycle(&conn, &devices, &observations).unwrap();
+
+        let loaded = load_devices(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let dev = &loaded["AA:BB:CC:DD:EE:01"];
+        assert_eq!(dev.name.as_deref(), Some("TestDevice"));
+        assert_eq!(dev.vendor.as_deref(), Some("TestVendor"));
+        assert_eq!(dev.device_type, DeviceType::Audio);
+        assert!(dev.is_randomized);
+        assert_eq!(dev.sightings, 3);
+        assert_eq!(dev.tx_power, Some(4));
+        assert_eq!(dev.fingerprint, "A1B2");
+        assert_eq!(dev.fast_pair_model.as_deref(), Some("Pixel Buds"));
+        assert_eq!(dev.service_uuids, vec!["0000180a", "0000180f"]);
+        assert_eq!(dev.note.as_deref(), Some("test note"));
+    }
+
+    #[test]
+    fn write_cycle_multiple_devices() {
+        let conn = open(":memory:").unwrap();
+
+        let mut devices = HashMap::new();
+        devices.insert("MAC1".into(), make_test_device("MAC1"));
+        devices.insert("MAC2".into(), make_test_device("MAC2"));
+
+        let observations = vec![
+            PendingObs { mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new() },
+            PendingObs { mac: "MAC2".into(), rssi: Some(-70), name: None, service_uuids: String::new() },
+        ];
+
+        write_cycle(&conn, &devices, &observations).unwrap();
+        let loaded = load_devices(&conn).unwrap();
+        assert_eq!(loaded.len(), 2);
+    }
+
+    // ── update_note ──────────────────────────────────────────────────────
+
+    #[test]
+    fn update_note_persists() {
+        let conn = open(":memory:").unwrap();
+        let mut devices = HashMap::new();
+        devices.insert("MAC1".into(), make_test_device("MAC1"));
+        let obs = vec![PendingObs {
+            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(),
+        }];
+        write_cycle(&conn, &devices, &obs).unwrap();
+
+        update_note(&conn, "MAC1", "updated note").unwrap();
+
+        let loaded = load_devices(&conn).unwrap();
+        assert_eq!(loaded["MAC1"].note.as_deref(), Some("updated note"));
+    }
+
+    // ── update_gatt_info ─────────────────────────────────────────────────
+
+    #[test]
+    fn update_gatt_info_persists() {
+        let conn = open(":memory:").unwrap();
+        let mut devices = HashMap::new();
+        devices.insert("MAC1".into(), make_test_device("MAC1"));
+        let obs = vec![PendingObs {
+            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(),
+        }];
+        write_cycle(&conn, &devices, &obs).unwrap();
+
+        let info = GattDeviceInfo {
+            manufacturer_name: Some("Acme Corp".into()),
+            model_number: Some("Model X".into()),
+            firmware_revision: Some("1.0.0".into()),
+            hardware_revision: None,
+            software_revision: None,
+            battery_level: None,
+            pnp_id: None,
+            probed_at: "2025-06-15T14:30:00Z".into(),
+        };
+        update_gatt_info(&conn, "MAC1", &info).unwrap();
+
+        let loaded = load_devices(&conn).unwrap();
+        let gatt = loaded["MAC1"].gatt_info.as_ref().unwrap();
+        assert_eq!(gatt.manufacturer_name.as_deref(), Some("Acme Corp"));
+        assert_eq!(gatt.model_number.as_deref(), Some("Model X"));
+    }
+}
