@@ -108,10 +108,22 @@ async fn run(
     let db_path_str = db_path.to_str().unwrap_or("bluemon.db").to_string();
     let mut app = App::new(db_path_str);
 
-    // Load persisted devices from DB
+    // Load persisted devices from DB and reclassify with latest classifier data
     match db::load_devices(&conn) {
         Ok(devices) => {
             app.devices = devices;
+            for dev in app.devices.values_mut() {
+                let new_type = classifier::classify_device(
+                    dev.vendor.as_deref(),
+                    dev.name.as_deref(),
+                    &dev.service_uuids,
+                    &dev.manufacturer_data,
+                    dev.device_class,
+                );
+                if new_type != classifier::DeviceType::Unknown {
+                    dev.device_type = new_type;
+                }
+            }
             app.rebuild_fingerprint_groups();
             app.rebuild_sorted_list();
         }
@@ -237,10 +249,19 @@ async fn run(
                             if app.table_state.selected().is_some() {
                                 app.detail_mode = true;
                                 app.detail_scroll = 0;
+                                load_detail_data(&mut app, &conn);
                             }
                         }
                         KeyCode::Char('p') => {
                             try_probe(&mut app);
+                        }
+                        KeyCode::Char('e') => {
+                            let path = export_view(&app, "csv");
+                            app.probe_status = Some((path, Local::now()));
+                        }
+                        KeyCode::Char('E') => {
+                            let path = export_view(&app, "json");
+                            app.probe_status = Some((path, Local::now()));
                         }
                         KeyCode::Char('s') => app.cycle_sort(),
                         KeyCode::Char('S') => app.reverse_sort(),
@@ -350,4 +371,91 @@ fn try_probe(app: &mut App) {
     } else {
         app.probe_status = Some(("Probe on cooldown (5 min)".to_string(), now));
     }
+}
+
+/// Export the current display list to CSV or JSON.
+fn export_view(app: &App, format: &str) -> String {
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    let ext = format;
+    let dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("bluemon-tui");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("export-{timestamp}.{ext}"));
+
+    let devices: Vec<&app::AggregatedDevice> = app
+        .display_list
+        .iter()
+        .filter_map(|fp| app.aggregated.get(fp))
+        .collect();
+
+    let result = match format {
+        "json" => export_json(&devices),
+        _ => export_csv(&devices),
+    };
+
+    match result {
+        Ok(content) => match std::fs::write(&path, content) {
+            Ok(_) => format!("Exported {} devices to {}", devices.len(), path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        },
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
+
+fn export_csv(devices: &[&app::AggregatedDevice]) -> anyhow::Result<String> {
+    let mut out = String::from("fingerprint,mac,name,vendor,type,rssi,distance,sightings,first_seen,last_seen,note\n");
+    for d in devices {
+        let name = d.name.as_deref().unwrap_or("").replace('"', "\"\"");
+        let vendor = d.vendor.as_deref().unwrap_or("").replace('"', "\"\"");
+        let note = d.note.as_deref().unwrap_or("").replace('"', "\"\"");
+        let dist = app::format_distance(d.rssi, d.tx_power, d.ibeacon_measured_power);
+        let rssi = d.rssi.map(|r| r.to_string()).unwrap_or_default();
+        out.push_str(&format!(
+            "{},\"{}\",\"{}\",\"{}\",{},{},{},{},{},{},\"{}\"\n",
+            d.fingerprint, d.representative_mac, name, vendor,
+            d.device_type.label(), rssi, dist, d.sightings,
+            d.first_seen.to_rfc3339(), d.last_seen.to_rfc3339(), note,
+        ));
+    }
+    Ok(out)
+}
+
+fn export_json(devices: &[&app::AggregatedDevice]) -> anyhow::Result<String> {
+    let entries: Vec<serde_json::Value> = devices
+        .iter()
+        .map(|d| {
+            let dist = app::format_distance(d.rssi, d.tx_power, d.ibeacon_measured_power);
+            serde_json::json!({
+                "fingerprint": d.fingerprint,
+                "mac": d.representative_mac,
+                "name": d.name,
+                "vendor": d.vendor,
+                "type": d.device_type.label(),
+                "rssi": d.rssi,
+                "distance": dist,
+                "sightings": d.sightings,
+                "first_seen": d.first_seen.to_rfc3339(),
+                "last_seen": d.last_seen.to_rfc3339(),
+                "note": d.note,
+                "mac_count": d.mac_count,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&entries)?)
+}
+
+/// Load detail view data (RSSI history, hourly activity, rotation stats) from DB.
+fn load_detail_data(app: &mut App, conn: &rusqlite::Connection) {
+    let Some(idx) = app.table_state.selected() else { return };
+    let Some(fp) = app.display_list.get(idx) else { return };
+    let macs: Vec<String> = app
+        .fingerprint_groups
+        .get(fp)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+
+    app.detail_rssi_history = db::recent_rssi(conn, &macs, 60).unwrap_or_default();
+    app.detail_hourly = db::hourly_activity(conn, &macs).unwrap_or([0; 24]);
+    app.detail_rotation = db::mac_rotation_stats(conn, &macs).ok();
 }

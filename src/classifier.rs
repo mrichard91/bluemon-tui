@@ -583,6 +583,29 @@ pub enum BleAddrType {
     Multicast,
 }
 
+impl BleAddrType {
+    pub fn to_db(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::RandomStatic => "random_static",
+            Self::ResolvablePrivate => "resolvable_private",
+            Self::NonResolvablePrivate => "non_resolvable_private",
+            Self::Multicast => "multicast",
+        }
+    }
+
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "public" => Some(Self::Public),
+            "random_static" => Some(Self::RandomStatic),
+            "resolvable_private" => Some(Self::ResolvablePrivate),
+            "non_resolvable_private" => Some(Self::NonResolvablePrivate),
+            "multicast" => Some(Self::Multicast),
+            _ => None,
+        }
+    }
+}
+
 /// Parse BLE address type from the first octet of a MAC address.
 ///
 /// First octet bits:

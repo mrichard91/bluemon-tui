@@ -1,5 +1,5 @@
 use crate::app::DeviceInfo;
-use crate::classifier::DeviceType;
+use crate::classifier::{self, DeviceType};
 use crate::continuity::ContinuityData;
 use crate::gatt::GattDeviceInfo;
 use chrono::{DateTime, Local};
@@ -71,6 +71,19 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
              ALTER TABLE devices ADD COLUMN gatt_info_json TEXT DEFAULT '';
              ALTER TABLE devices ADD COLUMN fast_pair_model TEXT DEFAULT '';",
         )?;
+    }
+
+    if conn
+        .prepare("SELECT device_class FROM devices LIMIT 0")
+        .is_err()
+    {
+        conn.execute_batch("ALTER TABLE devices ADD COLUMN device_class INTEGER;")?;
+    }
+    if conn
+        .prepare("SELECT addr_type FROM devices LIMIT 0")
+        .is_err()
+    {
+        conn.execute_batch("ALTER TABLE devices ADD COLUMN addr_type TEXT DEFAULT '';")?;
     }
 
     seed_reference_data(&conn)?;
@@ -150,33 +163,33 @@ pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceI
     let mut stmt = conn.prepare(
         "SELECT mac, name, vendor, device_type, is_randomized,
                 first_seen, last_seen, note, service_uuids, sightings, tx_power, fingerprint,
-                continuity_json, gatt_info_json, fast_pair_model, last_rssi
+                continuity_json, gatt_info_json, fast_pair_model, last_rssi,
+                device_class, addr_type
          FROM devices",
     )?;
     let mut devices = HashMap::new();
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, bool>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, Option<String>>(7)?,
-            row.get::<_, Option<String>>(8)?,
-            row.get::<_, u32>(9)?,
-            row.get::<_, Option<i16>>(10)?,
-            row.get::<_, Option<String>>(11)?,
-            row.get::<_, Option<String>>(12)?,
-            row.get::<_, Option<String>>(13)?,
-            row.get::<_, Option<String>>(14)?,
-            row.get::<_, Option<i16>>(15)?,
-        ))
-    })?;
+    let mut rows = stmt.query([])?;
 
-    for row in rows {
-        let (mac, name, vendor, dtype_str, is_randomized, first_str, last_str, note, uuids_str, sightings, tx_power, fingerprint, continuity_json, gatt_info_json, fast_pair_model, last_rssi) = row?;
+    while let Some(row) = rows.next()? {
+        let mac: String = row.get(0)?;
+        let name: Option<String> = row.get(1)?;
+        let vendor: Option<String> = row.get(2)?;
+        let dtype_str: String = row.get(3)?;
+        let is_randomized: bool = row.get(4)?;
+        let first_str: String = row.get(5)?;
+        let last_str: String = row.get(6)?;
+        let note: Option<String> = row.get(7)?;
+        let uuids_str: Option<String> = row.get(8)?;
+        let sightings: u32 = row.get(9)?;
+        let tx_power: Option<i16> = row.get(10)?;
+        let fingerprint: Option<String> = row.get(11)?;
+        let continuity_json: Option<String> = row.get(12)?;
+        let gatt_info_json: Option<String> = row.get(13)?;
+        let fast_pair_model: Option<String> = row.get(14)?;
+        let last_rssi: Option<i16> = row.get(15)?;
+        let device_class: Option<u32> = row.get(16)?;
+        let addr_type_str: Option<String> = row.get(17)?;
+
         let device_type = DeviceType::from_db(&dtype_str);
         let first_seen = DateTime::parse_from_rfc3339(&first_str)
             .map(|dt| dt.with_timezone(&Local))
@@ -200,6 +213,11 @@ pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceI
             .filter(|s| !s.is_empty())
             .and_then(|s| serde_json::from_str::<GattDeviceInfo>(s).ok());
         let fast_pair_model = fast_pair_model.filter(|s| !s.is_empty());
+        let addr_type = addr_type_str
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(classifier::BleAddrType::from_db)
+            .or_else(|| classifier::parse_addr_type(&mac));
 
         devices.insert(
             mac.clone(),
@@ -221,6 +239,8 @@ pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceI
                 continuity,
                 gatt_info,
                 fast_pair_model,
+                device_class,
+                addr_type,
             },
         );
     }
@@ -260,8 +280,9 @@ pub fn write_cycle(
         let mut dev_stmt = tx.prepare_cached(
             "INSERT INTO devices (mac, name, vendor, device_type, is_randomized,
                                   first_seen, last_seen, note, service_uuids, sightings, tx_power, fingerprint,
-                                  continuity_json, gatt_info_json, fast_pair_model, last_rssi)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                                  continuity_json, gatt_info_json, fast_pair_model, last_rssi,
+                                  device_class, addr_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(mac) DO UPDATE SET
                  name = COALESCE(?2, name),
                  vendor = COALESCE(?3, vendor),
@@ -274,7 +295,9 @@ pub fn write_cycle(
                  continuity_json = CASE WHEN ?13 = '' THEN continuity_json ELSE ?13 END,
                  gatt_info_json = CASE WHEN ?14 = '' THEN gatt_info_json ELSE ?14 END,
                  fast_pair_model = CASE WHEN ?15 = '' THEN fast_pair_model ELSE ?15 END,
-                 last_rssi = COALESCE(?16, last_rssi)",
+                 last_rssi = COALESCE(?16, last_rssi),
+                 device_class = COALESCE(?17, device_class),
+                 addr_type = CASE WHEN ?18 = '' THEN addr_type ELSE ?18 END",
         )?;
 
         let mut written = std::collections::HashSet::new();
@@ -312,6 +335,8 @@ pub fn write_cycle(
                     gatt_info_json,
                     fast_pair_model,
                     d.rssi,
+                    d.device_class,
+                    d.addr_type.map(|a| a.to_db()).unwrap_or(""),
                 ])?;
             }
         }
@@ -340,6 +365,105 @@ pub fn update_note(conn: &Connection, mac: &str, note: &str) -> anyhow::Result<(
         params![note, mac],
     )?;
     Ok(())
+}
+
+/// Fetch recent RSSI readings for a set of MACs (ordered oldest → newest).
+pub fn recent_rssi(conn: &Connection, macs: &[String], limit: usize) -> anyhow::Result<Vec<i16>> {
+    if macs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = macs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT rssi FROM (
+            SELECT rssi, seen_at FROM observations
+            WHERE mac IN ({placeholders}) AND rssi IS NOT NULL
+            ORDER BY seen_at DESC LIMIT ?
+        ) ORDER BY seen_at ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut values: Vec<i16> = Vec::new();
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = macs
+        .iter()
+        .map(|m| Box::new(m.clone()) as Box<dyn rusqlite::types::ToSql>)
+        .chain(std::iter::once(Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>))
+        .collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut rows = stmt.query(refs.as_slice())?;
+    while let Some(row) = rows.next()? {
+        values.push(row.get(0)?);
+    }
+    Ok(values)
+}
+
+/// Count observations per hour-of-day (0–23) for a set of MACs.
+pub fn hourly_activity(conn: &Connection, macs: &[String]) -> anyhow::Result<[u32; 24]> {
+    let mut counts = [0u32; 24];
+    if macs.is_empty() {
+        return Ok(counts);
+    }
+    let placeholders = macs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT CAST(strftime('%H', seen_at, 'localtime') AS INTEGER) AS hour, COUNT(*)
+         FROM observations WHERE mac IN ({placeholders})
+         GROUP BY hour"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = macs
+        .iter()
+        .map(|m| Box::new(m.clone()) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut rows = stmt.query(refs.as_slice())?;
+    while let Some(row) = rows.next()? {
+        let hour: u32 = row.get(0)?;
+        let count: u32 = row.get(1)?;
+        if (hour as usize) < 24 {
+            counts[hour as usize] = count;
+        }
+    }
+    Ok(counts)
+}
+
+/// MAC rotation stats for a fingerprinted device group.
+pub struct MacRotationStats {
+    pub total_macs: usize,
+    pub avg_rotation_mins: Option<f64>,
+}
+
+pub fn mac_rotation_stats(conn: &Connection, macs: &[String]) -> anyhow::Result<MacRotationStats> {
+    if macs.len() <= 1 {
+        return Ok(MacRotationStats { total_macs: macs.len(), avg_rotation_mins: None });
+    }
+    let placeholders = macs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT first_seen FROM devices WHERE mac IN ({placeholders}) ORDER BY first_seen ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = macs
+        .iter()
+        .map(|m| Box::new(m.clone()) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut rows = stmt.query(refs.as_slice())?;
+    let mut timestamps: Vec<DateTime<Local>> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let ts: String = row.get(0)?;
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&ts) {
+            timestamps.push(dt.with_timezone(&Local));
+        }
+    }
+    if timestamps.len() <= 1 {
+        return Ok(MacRotationStats { total_macs: macs.len(), avg_rotation_mins: None });
+    }
+    let total_mins: f64 = timestamps
+        .windows(2)
+        .map(|w| (w[1] - w[0]).num_seconds().abs() as f64 / 60.0)
+        .sum();
+    let avg = total_mins / (timestamps.len() - 1) as f64;
+    Ok(MacRotationStats {
+        total_macs: macs.len(),
+        avg_rotation_mins: Some(avg),
+    })
 }
 
 #[cfg(test)]
@@ -399,6 +523,8 @@ mod tests {
             continuity: None,
             gatt_info: None,
             fast_pair_model: Some("Pixel Buds".into()),
+            device_class: Some(0x200404),
+            addr_type: Some(classifier::BleAddrType::RandomStatic),
         }
     }
 
@@ -432,6 +558,8 @@ mod tests {
         assert_eq!(dev.fast_pair_model.as_deref(), Some("Pixel Buds"));
         assert_eq!(dev.service_uuids, vec!["0000180a", "0000180f"]);
         assert_eq!(dev.note.as_deref(), Some("test note"));
+        assert_eq!(dev.device_class, Some(0x200404));
+        assert_eq!(dev.addr_type, Some(classifier::BleAddrType::RandomStatic));
     }
 
     #[test]

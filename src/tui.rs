@@ -269,7 +269,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     } else {
         f.render_widget(
             Paragraph::new(
-                "q:Quit  c:Chat  d:Detail  p:Probe  s:Sort  S:Reverse  /:Filter  Enter:Note  j/k:Scroll",
+                "q:Quit  d:Detail  p:Probe  s/S:Sort  /:Filter  Enter:Note  e:CSV  E:JSON  j/k:Scroll",
             )
             .style(Style::default().fg(Color::DarkGray)),
             area,
@@ -541,6 +541,112 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
+            }
+        }
+    }
+
+    // Device class
+    if let Some(dc) = agg.device_class {
+        let major = (dc >> 8) & 0x1F;
+        let minor = (dc >> 2) & 0x3F;
+        let major_str = match major {
+            1 => "Computer",
+            2 => "Phone",
+            3 => "LAN/Network",
+            4 => "Audio/Video",
+            5 => "Peripheral",
+            6 => "Imaging",
+            7 => "Wearable",
+            8 => "Toy",
+            9 => "Health",
+            _ => "Other",
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Device Class:", label_style),
+            Span::styled(format!(" {major_str} ({major}/{minor}) [0x{dc:06X}]"), value_style),
+        ]));
+    }
+
+    // RSSI sparkline
+    if !app.detail_rssi_history.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "-- RSSI Trend (recent) --",
+            section_style,
+        )));
+        let bars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+        let min_rssi = app.detail_rssi_history.iter().copied().min().unwrap_or(-100) as f64;
+        let max_rssi = app.detail_rssi_history.iter().copied().max().unwrap_or(-30) as f64;
+        let range = (max_rssi - min_rssi).max(1.0);
+        let sparkline: String = app.detail_rssi_history.iter().map(|&r| {
+            let norm = ((r as f64 - min_rssi) / range * 8.0) as usize;
+            bars[norm.min(8)]
+        }).collect();
+        lines.push(Line::from(vec![
+            Span::styled("  ", label_style),
+            Span::styled(sparkline, Style::default().fg(Color::Green)),
+        ]));
+        let last = app.detail_rssi_history.last().unwrap();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  Range: {} to {} dBm  Latest: {} dBm  ({} samples)",
+                    min_rssi as i16, max_rssi as i16, last, app.detail_rssi_history.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    // Hourly activity heatmap
+    if app.detail_hourly.iter().any(|&c| c > 0) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "-- Activity by Hour --",
+            section_style,
+        )));
+        let max_count = *app.detail_hourly.iter().max().unwrap_or(&1) as f64;
+        let bars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+        let heatmap: String = app.detail_hourly.iter().map(|&c| {
+            if c == 0 { '\u{2581}' }
+            else {
+                let norm = (c as f64 / max_count * 8.0) as usize;
+                bars[norm.min(8)]
+            }
+        }).collect();
+        lines.push(Line::from(vec![
+            Span::styled("  ", label_style),
+            Span::styled(heatmap, Style::default().fg(Color::Magenta)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  0     6     12    18    23"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    // MAC rotation stats
+    if let Some(ref rot) = app.detail_rotation {
+        if rot.total_macs > 1 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "-- MAC Rotation --",
+                section_style,
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("  Total MACs: ", label_style),
+                Span::styled(rot.total_macs.to_string(), value_style),
+            ]));
+            if let Some(avg) = rot.avg_rotation_mins {
+                let avg_str = if avg < 60.0 {
+                    format!("{:.0} min", avg)
+                } else {
+                    format!("{:.1} hrs", avg / 60.0)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  Avg interval: ", label_style),
+                    Span::styled(avg_str, value_style),
+                ]));
             }
         }
     }

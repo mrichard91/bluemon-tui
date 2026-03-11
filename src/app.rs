@@ -41,6 +41,8 @@ pub struct DeviceInfo {
     pub continuity: Option<ContinuityData>,
     pub gatt_info: Option<GattDeviceInfo>,
     pub fast_pair_model: Option<String>,
+    pub device_class: Option<u32>,
+    pub addr_type: Option<cls::BleAddrType>,
 }
 
 #[derive(Clone)]
@@ -60,6 +62,7 @@ pub struct AggregatedDevice {
     pub service_uuids: Vec<String>,
     pub is_randomized: bool,
     pub addr_type: Option<cls::BleAddrType>,
+    pub device_class: Option<u32>,
     pub continuity_summary: Option<String>,
     pub ibeacon_measured_power: Option<i8>,
     pub gatt_info: Option<GattDeviceInfo>,
@@ -166,6 +169,10 @@ pub struct App {
     pub probe_cooldowns: HashMap<String, DateTime<Local>>,
     /// Status message shown briefly after a probe attempt.
     pub probe_status: Option<(String, DateTime<Local>)>,
+    /// Cached detail view data (populated when entering detail mode).
+    pub detail_rssi_history: Vec<i16>,
+    pub detail_hourly: [u32; 24],
+    pub detail_rotation: Option<crate::db::MacRotationStats>,
 }
 
 impl App {
@@ -193,6 +200,9 @@ impl App {
             detail_scroll: 0,
             probe_cooldowns: HashMap::new(),
             probe_status: None,
+            detail_rssi_history: Vec::new(),
+            detail_hourly: [0; 24],
+            detail_rotation: None,
         }
     }
 
@@ -220,6 +230,8 @@ impl App {
                 continuity: None,
                 gatt_info: None,
                 fast_pair_model: None,
+                device_class: result.device_class,
+                addr_type: cls::parse_addr_type(&result.mac),
             }
         });
 
@@ -242,6 +254,9 @@ impl App {
         }
         if result.device_type != DeviceType::Unknown {
             entry.device_type = result.device_type;
+        }
+        if result.device_class.is_some() {
+            entry.device_class = result.device_class;
         }
 
         // Store manufacturer data and parse enrichment fields
@@ -340,7 +355,8 @@ impl App {
             let last_seen = devs.iter().map(|d| d.last_seen).max().unwrap();
             let note = devs.iter().find_map(|d| d.note.clone());
             let is_randomized = devs.iter().any(|d| d.is_randomized);
-            let addr_type = cls::parse_addr_type(&most_recent.mac);
+            let addr_type = most_recent.addr_type;
+            let device_class = devs.iter().find_map(|d| d.device_class);
 
             let mut uuid_set = HashSet::new();
             let mut service_uuids = Vec::new();
@@ -387,6 +403,7 @@ impl App {
                     service_uuids,
                     is_randomized,
                     addr_type,
+                    device_class,
                     continuity_summary,
                     ibeacon_measured_power,
                     gatt_info,
@@ -764,6 +781,7 @@ mod tests {
             sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
             note: None, fingerprint: "FP01".into(), manufacturer_data: HashMap::new(),
             continuity: None, gatt_info: None, fast_pair_model: None,
+            device_class: None, addr_type: None,
         });
         app.devices.insert("MAC2".into(), DeviceInfo {
             mac: "MAC2".into(), name: None, rssi: None, tx_power: None,
@@ -771,6 +789,7 @@ mod tests {
             sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
             note: None, fingerprint: "FP01".into(), manufacturer_data: HashMap::new(),
             continuity: None, gatt_info: None, fast_pair_model: None,
+            device_class: None, addr_type: None,
         });
         app.devices.insert("MAC3".into(), DeviceInfo {
             mac: "MAC3".into(), name: None, rssi: None, tx_power: None,
@@ -778,6 +797,7 @@ mod tests {
             sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
             note: None, fingerprint: "".into(), manufacturer_data: HashMap::new(),
             continuity: None, gatt_info: None, fast_pair_model: None,
+            device_class: None, addr_type: None,
         });
 
         app.rebuild_fingerprint_groups();
