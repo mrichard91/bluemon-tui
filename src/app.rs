@@ -433,7 +433,15 @@ impl App {
                 SortColumn::Distance => {
                     let dist_a = da.rssi.map(|r| estimate_distance(r, da.tx_power, da.ibeacon_measured_power));
                     let dist_b = db.rssi.map(|r| estimate_distance(r, db.tx_power, db.ibeacon_measured_power));
-                    dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+                    // Closest first (default), None always last; tie-break by last_seen (newest first)
+                    let cmp = match (dist_a, dist_b) {
+                        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                            .then(db.last_seen.cmp(&da.last_seen)),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => db.last_seen.cmp(&da.last_seen),
+                    };
+                    return if asc { cmp.reverse() } else { cmp };
                 }
                 SortColumn::Type => da.device_type.label().cmp(db.device_type.label()),
                 SortColumn::Mac => da.representative_mac.cmp(&db.representative_mac),

@@ -39,12 +39,18 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
          CREATE INDEX IF NOT EXISTS idx_obs_seen ON observations(seen_at);",
     )?;
 
-    // Migrate older databases that lack the tx_power column
+    // Migrate older databases that lack newer columns
     let has_tx_power: bool = conn
         .prepare("SELECT tx_power FROM devices LIMIT 0")
         .is_ok();
     if !has_tx_power {
         conn.execute_batch("ALTER TABLE devices ADD COLUMN tx_power INTEGER;")?;
+    }
+    let has_last_rssi: bool = conn
+        .prepare("SELECT last_rssi FROM devices LIMIT 0")
+        .is_ok();
+    if !has_last_rssi {
+        conn.execute_batch("ALTER TABLE devices ADD COLUMN last_rssi INTEGER;")?;
     }
 
     // Migrate older databases that lack the fingerprint column
@@ -144,7 +150,7 @@ pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceI
     let mut stmt = conn.prepare(
         "SELECT mac, name, vendor, device_type, is_randomized,
                 first_seen, last_seen, note, service_uuids, sightings, tx_power, fingerprint,
-                continuity_json, gatt_info_json, fast_pair_model
+                continuity_json, gatt_info_json, fast_pair_model, last_rssi
          FROM devices",
     )?;
     let mut devices = HashMap::new();
@@ -165,11 +171,12 @@ pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceI
             row.get::<_, Option<String>>(12)?,
             row.get::<_, Option<String>>(13)?,
             row.get::<_, Option<String>>(14)?,
+            row.get::<_, Option<i16>>(15)?,
         ))
     })?;
 
     for row in rows {
-        let (mac, name, vendor, dtype_str, is_randomized, first_str, last_str, note, uuids_str, sightings, tx_power, fingerprint, continuity_json, gatt_info_json, fast_pair_model) = row?;
+        let (mac, name, vendor, dtype_str, is_randomized, first_str, last_str, note, uuids_str, sightings, tx_power, fingerprint, continuity_json, gatt_info_json, fast_pair_model, last_rssi) = row?;
         let device_type = DeviceType::from_db(&dtype_str);
         let first_seen = DateTime::parse_from_rfc3339(&first_str)
             .map(|dt| dt.with_timezone(&Local))
@@ -199,7 +206,7 @@ pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceI
             DeviceInfo {
                 mac,
                 name,
-                rssi: None,
+                rssi: last_rssi,
                 tx_power,
                 vendor,
                 device_type,
@@ -253,8 +260,8 @@ pub fn write_cycle(
         let mut dev_stmt = tx.prepare_cached(
             "INSERT INTO devices (mac, name, vendor, device_type, is_randomized,
                                   first_seen, last_seen, note, service_uuids, sightings, tx_power, fingerprint,
-                                  continuity_json, gatt_info_json, fast_pair_model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                                  continuity_json, gatt_info_json, fast_pair_model, last_rssi)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(mac) DO UPDATE SET
                  name = COALESCE(?2, name),
                  vendor = COALESCE(?3, vendor),
@@ -266,7 +273,8 @@ pub fn write_cycle(
                  fingerprint = ?12,
                  continuity_json = CASE WHEN ?13 = '' THEN continuity_json ELSE ?13 END,
                  gatt_info_json = CASE WHEN ?14 = '' THEN gatt_info_json ELSE ?14 END,
-                 fast_pair_model = CASE WHEN ?15 = '' THEN fast_pair_model ELSE ?15 END",
+                 fast_pair_model = CASE WHEN ?15 = '' THEN fast_pair_model ELSE ?15 END,
+                 last_rssi = COALESCE(?16, last_rssi)",
         )?;
 
         let mut written = std::collections::HashSet::new();
@@ -303,6 +311,7 @@ pub fn write_cycle(
                     continuity_json,
                     gatt_info_json,
                     fast_pair_model,
+                    d.rssi,
                 ])?;
             }
         }
@@ -418,6 +427,7 @@ mod tests {
         assert!(dev.is_randomized);
         assert_eq!(dev.sightings, 3);
         assert_eq!(dev.tx_power, Some(4));
+        assert_eq!(dev.rssi, Some(-65));
         assert_eq!(dev.fingerprint, "A1B2");
         assert_eq!(dev.fast_pair_model.as_deref(), Some("Pixel Buds"));
         assert_eq!(dev.service_uuids, vec!["0000180a", "0000180f"]);
