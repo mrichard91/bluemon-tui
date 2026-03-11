@@ -260,6 +260,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(text).style(Style::default().fg(Color::Yellow)),
             area,
         );
+    } else if let Some((msg, _)) = &app.probe_status {
+        f.render_widget(
+            Paragraph::new(msg.as_str())
+                .style(Style::default().fg(Color::Cyan)),
+            area,
+        );
     } else {
         f.render_widget(
             Paragraph::new(
@@ -366,10 +372,17 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("Sightings:   ", label_style),
         Span::styled(agg.sightings.to_string(), value_style),
     ]));
-    if agg.is_randomized {
+    if let Some(addr_type) = agg.addr_type {
+        let (label, color) = match addr_type {
+            crate::classifier::BleAddrType::Public => ("Public (OUI-assigned)", Color::Green),
+            crate::classifier::BleAddrType::RandomStatic => ("Random Static", Color::Yellow),
+            crate::classifier::BleAddrType::ResolvablePrivate => ("Resolvable Private (RPA)", Color::Yellow),
+            crate::classifier::BleAddrType::NonResolvablePrivate => ("Non-Resolvable Private", Color::Red),
+            crate::classifier::BleAddrType::Multicast => ("Multicast (anomalous)", Color::Red),
+        };
         lines.push(Line::from(vec![
-            Span::styled("Randomized:  ", label_style),
-            Span::styled("Yes", Style::default().fg(Color::Yellow)),
+            Span::styled("Addr Type:   ", label_style),
+            Span::styled(label, Style::default().fg(color)),
         ]));
     }
     if let Some(note) = &agg.note {

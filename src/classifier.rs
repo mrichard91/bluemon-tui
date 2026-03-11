@@ -568,6 +568,48 @@ pub fn is_randomized_mac(mac: &str) -> bool {
     byte & 0x02 != 0
 }
 
+/// BLE address type parsed from the MAC's first octet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BleAddrType {
+    /// IEEE-assigned OUI, globally unique (bit 1 = 0)
+    Public,
+    /// Random static — persists across power cycles (top 2 bits = 11)
+    RandomStatic,
+    /// Resolvable private — rotates, resolvable via IRK (top 2 bits = 01)
+    ResolvablePrivate,
+    /// Non-resolvable private — fully random (top 2 bits = 00)
+    NonResolvablePrivate,
+    /// Multicast bit set — anomalous for BLE (bit 0 = 1)
+    Multicast,
+}
+
+/// Parse BLE address type from the first octet of a MAC address.
+///
+/// First octet bits:
+/// - Bit 0: unicast (0) / multicast (1) — multicast is anomalous in BLE
+/// - Bit 1: universally administered (0) / locally administered (1)
+/// For locally-administered (random) addresses, the top 2 bits of the
+/// first octet identify the random subtype:
+/// - 11: Random Static
+/// - 01: Resolvable Private Address (RPA)
+/// - 00: Non-Resolvable Private
+pub fn parse_addr_type(mac: &str) -> Option<BleAddrType> {
+    let first = mac.split(':').next()?;
+    let byte = u8::from_str_radix(first, 16).ok()?;
+    if byte & 0x01 != 0 {
+        return Some(BleAddrType::Multicast);
+    }
+    if byte & 0x02 == 0 {
+        return Some(BleAddrType::Public);
+    }
+    // Locally administered → check random subtype from top 2 bits
+    match byte >> 6 {
+        0b11 => Some(BleAddrType::RandomStatic),
+        0b01 => Some(BleAddrType::ResolvablePrivate),
+        _ => Some(BleAddrType::NonResolvablePrivate),
+    }
+}
+
 /// Compute a short fingerprint for a device based on its advertising signature.
 ///
 /// Devices that rotate their MAC address will still produce the same fingerprint
@@ -685,6 +727,44 @@ mod tests {
     fn randomized_mac_invalid() {
         assert!(!is_randomized_mac(""));
         assert!(!is_randomized_mac("ZZ:11:22:33:44:55"));
+    }
+
+    // ── parse_addr_type ───────────────────────────────────────────────
+
+    #[test]
+    fn addr_type_public() {
+        // 0xAC = 10101100 → bit1=0 (universal), bit0=0 (unicast)
+        assert_eq!(parse_addr_type("AC:DE:48:00:11:22"), Some(BleAddrType::Public));
+    }
+
+    #[test]
+    fn addr_type_random_static() {
+        // 0xDE = 11011110 → bit1=1 (local), top 2 bits = 11
+        assert_eq!(parse_addr_type("DE:AA:BB:CC:DD:EE"), Some(BleAddrType::RandomStatic));
+    }
+
+    #[test]
+    fn addr_type_resolvable_private() {
+        // 0x5E = 01011110 → bit1=1 (local), top 2 bits = 01
+        assert_eq!(parse_addr_type("5E:AA:BB:CC:DD:EE"), Some(BleAddrType::ResolvablePrivate));
+    }
+
+    #[test]
+    fn addr_type_non_resolvable() {
+        // 0x1E = 00011110 → bit1=1 (local), top 2 bits = 00
+        assert_eq!(parse_addr_type("1E:AA:BB:CC:DD:EE"), Some(BleAddrType::NonResolvablePrivate));
+    }
+
+    #[test]
+    fn addr_type_multicast() {
+        // 0xAD = 10101101 → bit0=1 (multicast)
+        assert_eq!(parse_addr_type("AD:DE:48:00:11:22"), Some(BleAddrType::Multicast));
+    }
+
+    #[test]
+    fn addr_type_invalid() {
+        assert_eq!(parse_addr_type(""), None);
+        assert_eq!(parse_addr_type("ZZ:11:22:33:44:55"), None);
     }
 
     // ── compute_fingerprint ──────────────────────────────────────────────

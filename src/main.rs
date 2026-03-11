@@ -293,15 +293,27 @@ async fn run(
 
         // Drain GATT probe results
         while let Ok(result) = probe_res_rx.try_recv() {
+            let now = Local::now();
             match result {
                 gatt::ProbeResult::Success { mac, info } => {
+                    let summary = info.model_number.clone().unwrap_or_else(|| "OK".into());
+                    app.probe_status = Some((format!("Probe {mac}: {summary}"), now));
                     if let Some(d) = app.devices.get_mut(&mac) {
                         d.gatt_info = Some(info.clone());
                         let _ = db::update_gatt_info(&conn, &mac, &info);
                     }
                     app.rebuild_sorted_list();
                 }
-                gatt::ProbeResult::Failed { .. } => {}
+                gatt::ProbeResult::Failed { mac, error } => {
+                    app.probe_status = Some((format!("Probe {mac}: {error}"), now));
+                }
+            }
+        }
+
+        // Clear probe status after 8 seconds
+        if let Some((_, ts)) = &app.probe_status {
+            if Local::now().signed_duration_since(*ts).num_seconds() >= 8 {
+                app.probe_status = None;
             }
         }
     }
@@ -317,21 +329,25 @@ fn try_probe(app: &mut App) {
     let Some(fp) = app.display_list.get(idx) else {
         return;
     };
-    let Some(agg) = app.aggregated.get(fp) else {
+    let fp = fp.clone();
+    let Some(agg) = app.aggregated.get(&fp) else {
         return;
     };
     let mac = agg.representative_mac.clone();
     let now = Local::now();
     let can_probe = app
         .probe_cooldowns
-        .get(&mac)
+        .get(&fp)
         .map_or(true, |last| {
             now.signed_duration_since(*last).num_seconds() >= 300
         });
     if can_probe {
-        app.probe_cooldowns.insert(mac.clone(), now);
+        app.probe_cooldowns.insert(fp, now);
+        app.probe_status = Some((format!("Probing {mac}..."), now));
         if let Some(tx) = &app.probe_tx {
             let _ = tx.send(gatt::ProbeRequest::Probe { mac });
         }
+    } else {
+        app.probe_status = Some(("Probe on cooldown (5 min)".to_string(), now));
     }
 }

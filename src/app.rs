@@ -1,5 +1,5 @@
 use crate::chat::ChatState;
-use crate::classifier::DeviceType;
+use crate::classifier::{self as cls, DeviceType};
 use crate::continuity::ContinuityData;
 use crate::gatt::{self, GattDeviceInfo};
 use crate::scanner::ScanResult;
@@ -59,6 +59,7 @@ pub struct AggregatedDevice {
     pub note: Option<String>,
     pub service_uuids: Vec<String>,
     pub is_randomized: bool,
+    pub addr_type: Option<cls::BleAddrType>,
     pub continuity_summary: Option<String>,
     pub ibeacon_measured_power: Option<i8>,
     pub gatt_info: Option<GattDeviceInfo>,
@@ -163,6 +164,8 @@ pub struct App {
     pub detail_mode: bool,
     pub detail_scroll: usize,
     pub probe_cooldowns: HashMap<String, DateTime<Local>>,
+    /// Status message shown briefly after a probe attempt.
+    pub probe_status: Option<(String, DateTime<Local>)>,
 }
 
 impl App {
@@ -189,6 +192,7 @@ impl App {
             detail_mode: false,
             detail_scroll: 0,
             probe_cooldowns: HashMap::new(),
+            probe_status: None,
         }
     }
 
@@ -336,6 +340,7 @@ impl App {
             let last_seen = devs.iter().map(|d| d.last_seen).max().unwrap();
             let note = devs.iter().find_map(|d| d.note.clone());
             let is_randomized = devs.iter().any(|d| d.is_randomized);
+            let addr_type = cls::parse_addr_type(&most_recent.mac);
 
             let mut uuid_set = HashSet::new();
             let mut service_uuids = Vec::new();
@@ -381,6 +386,7 @@ impl App {
                     note,
                     service_uuids,
                     is_randomized,
+                    addr_type,
                     continuity_summary,
                     ibeacon_measured_power,
                     gatt_info,
