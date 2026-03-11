@@ -627,4 +627,137 @@ mod tests {
         assert_eq!(gatt.manufacturer_name.as_deref(), Some("Acme Corp"));
         assert_eq!(gatt.model_number.as_deref(), Some("Model X"));
     }
+
+    // ── recent_rssi ─────────────────────────────────────────────────────
+
+    fn seed_observations(conn: &Connection, mac: &str, rssi_values: &[i16]) {
+        let mut devices = HashMap::new();
+        devices.insert(mac.to_string(), make_test_device(mac));
+        let obs = vec![PendingObs {
+            mac: mac.to_string(), rssi: Some(-60), name: None, service_uuids: String::new(),
+        }];
+        write_cycle(conn, &devices, &obs).unwrap();
+
+        for (i, &rssi) in rssi_values.iter().enumerate() {
+            let ts = format!("2025-06-15T14:{:02}:00+00:00", i);
+            conn.execute(
+                "INSERT INTO observations (mac, seen_at, rssi) VALUES (?1, ?2, ?3)",
+                params![mac, ts, rssi],
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn recent_rssi_returns_values() {
+        let conn = open(":memory:").unwrap();
+        seed_observations(&conn, "MAC1", &[-60, -65, -70, -55]);
+        let result = recent_rssi(&conn, &["MAC1".into()], 10).unwrap();
+        // 5 total: 1 from write_cycle (current timestamp) + 4 manual inserts (2025 timestamps)
+        assert_eq!(result.len(), 5);
+        // All seeded values should be present
+        assert!(result.contains(&-60));
+        assert!(result.contains(&-65));
+        assert!(result.contains(&-70));
+        assert!(result.contains(&-55));
+    }
+
+    #[test]
+    fn recent_rssi_respects_limit() {
+        let conn = open(":memory:").unwrap();
+        seed_observations(&conn, "MAC1", &[-60, -65, -70, -55, -80]);
+        let result = recent_rssi(&conn, &["MAC1".into()], 3).unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn recent_rssi_empty_macs() {
+        let conn = open(":memory:").unwrap();
+        let result = recent_rssi(&conn, &[], 10).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── hourly_activity ─────────────────────────────────────────────────
+
+    #[test]
+    fn hourly_activity_counts() {
+        let conn = open(":memory:").unwrap();
+        let mut devices = HashMap::new();
+        devices.insert("MAC1".to_string(), make_test_device("MAC1"));
+        let obs = vec![PendingObs {
+            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(),
+        }];
+        write_cycle(&conn, &devices, &obs).unwrap();
+
+        // Insert observations at hour 10 and hour 14
+        for ts in &["2025-06-15T10:00:00+00:00", "2025-06-15T10:30:00+00:00", "2025-06-15T14:00:00+00:00"] {
+            conn.execute(
+                "INSERT INTO observations (mac, seen_at, rssi) VALUES (?1, ?2, -60)",
+                params!["MAC1", ts],
+            ).unwrap();
+        }
+
+        let counts = hourly_activity(&conn, &["MAC1".into()]).unwrap();
+        // We should see counts at hours 10 and 14 (exact hours depend on UTC→local conversion)
+        let total: u32 = counts.iter().sum();
+        assert!(total >= 3, "Expected at least 3 observations, got {total}");
+    }
+
+    #[test]
+    fn hourly_activity_empty_macs() {
+        let conn = open(":memory:").unwrap();
+        let counts = hourly_activity(&conn, &[]).unwrap();
+        assert_eq!(counts, [0u32; 24]);
+    }
+
+    // ── mac_rotation_stats ──────────────────────────────────────────────
+
+    #[test]
+    fn mac_rotation_single_mac() {
+        let conn = open(":memory:").unwrap();
+        let mut devices = HashMap::new();
+        devices.insert("MAC1".to_string(), make_test_device("MAC1"));
+        let obs = vec![PendingObs {
+            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(),
+        }];
+        write_cycle(&conn, &devices, &obs).unwrap();
+
+        let stats = mac_rotation_stats(&conn, &["MAC1".into()]).unwrap();
+        assert_eq!(stats.total_macs, 1);
+        assert!(stats.avg_rotation_mins.is_none());
+    }
+
+    #[test]
+    fn mac_rotation_multiple_macs() {
+        let conn = open(":memory:").unwrap();
+
+        let mut d1 = make_test_device("MAC1");
+        d1.first_seen = DateTime::parse_from_rfc3339("2025-06-15T10:00:00+00:00")
+            .unwrap().with_timezone(&Local);
+        let mut d2 = make_test_device("MAC2");
+        d2.first_seen = DateTime::parse_from_rfc3339("2025-06-15T11:00:00+00:00")
+            .unwrap().with_timezone(&Local);
+
+        let mut devices = HashMap::new();
+        devices.insert("MAC1".to_string(), d1);
+        devices.insert("MAC2".to_string(), d2);
+        let obs = vec![
+            PendingObs { mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new() },
+            PendingObs { mac: "MAC2".into(), rssi: Some(-60), name: None, service_uuids: String::new() },
+        ];
+        write_cycle(&conn, &devices, &obs).unwrap();
+
+        let stats = mac_rotation_stats(&conn, &["MAC1".into(), "MAC2".into()]).unwrap();
+        assert_eq!(stats.total_macs, 2);
+        assert!(stats.avg_rotation_mins.is_some());
+        let avg = stats.avg_rotation_mins.unwrap();
+        assert!((avg - 60.0).abs() < 1.0, "Expected ~60 min rotation, got {avg}");
+    }
+
+    #[test]
+    fn mac_rotation_empty_macs() {
+        let conn = open(":memory:").unwrap();
+        let stats = mac_rotation_stats(&conn, &[]).unwrap();
+        assert_eq!(stats.total_macs, 0);
+        assert!(stats.avg_rotation_mins.is_none());
+    }
 }

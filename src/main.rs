@@ -113,15 +113,21 @@ async fn run(
         Ok(devices) => {
             app.devices = devices;
             for dev in app.devices.values_mut() {
-                let new_type = classifier::classify_device(
-                    dev.vendor.as_deref(),
-                    dev.name.as_deref(),
-                    &dev.service_uuids,
-                    &dev.manufacturer_data,
-                    dev.device_class,
-                );
-                if new_type != classifier::DeviceType::Unknown {
-                    dev.device_type = new_type;
+                // Only reclassify devices currently typed as Unknown.
+                // After DB load, manufacturer_data is always empty, so
+                // re-running the full classifier could downgrade devices
+                // that were correctly typed via manufacturer data at scan time.
+                if dev.device_type == classifier::DeviceType::Unknown {
+                    let new_type = classifier::classify_device(
+                        dev.vendor.as_deref(),
+                        dev.name.as_deref(),
+                        &dev.service_uuids,
+                        &dev.manufacturer_data,
+                        dev.device_class,
+                    );
+                    if new_type != classifier::DeviceType::Unknown {
+                        dev.device_type = new_type;
+                    }
                 }
             }
             app.rebuild_fingerprint_groups();
@@ -412,7 +418,7 @@ fn export_csv(devices: &[&app::AggregatedDevice]) -> anyhow::Result<String> {
         let dist = app::format_distance(d.rssi, d.tx_power, d.ibeacon_measured_power);
         let rssi = d.rssi.map(|r| r.to_string()).unwrap_or_default();
         out.push_str(&format!(
-            "{},\"{}\",\"{}\",\"{}\",{},{},{},{},{},{},\"{}\"\n",
+            "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"\n",
             d.fingerprint, d.representative_mac, name, vendor,
             d.device_type.label(), rssi, dist, d.sightings,
             d.first_seen.to_rfc3339(), d.last_seen.to_rfc3339(), note,

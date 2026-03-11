@@ -578,10 +578,15 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         let bars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
         let min_rssi = app.detail_rssi_history.iter().copied().min().unwrap_or(-100) as f64;
         let max_rssi = app.detail_rssi_history.iter().copied().max().unwrap_or(-30) as f64;
-        let range = (max_rssi - min_rssi).max(1.0);
+        let range = max_rssi - min_rssi;
         let sparkline: String = app.detail_rssi_history.iter().map(|&r| {
-            let norm = ((r as f64 - min_rssi) / range * 8.0) as usize;
-            bars[norm.min(8)]
+            if range < 1.0 {
+                // All values identical — show mid-level bar instead of invisible
+                bars[4]
+            } else {
+                let norm = ((r as f64 - min_rssi) / range * 8.0) as usize;
+                bars[norm.min(8)]
+            }
         }).collect();
         lines.push(Line::from(vec![
             Span::styled("  ", label_style),

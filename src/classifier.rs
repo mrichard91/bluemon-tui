@@ -790,6 +790,30 @@ mod tests {
         assert_eq!(parse_addr_type("ZZ:11:22:33:44:55"), None);
     }
 
+    // ── BleAddrType to_db/from_db round-trip ─────────────────────────────
+
+    #[test]
+    fn addr_type_round_trip_all_variants() {
+        let variants = [
+            BleAddrType::Public,
+            BleAddrType::RandomStatic,
+            BleAddrType::ResolvablePrivate,
+            BleAddrType::NonResolvablePrivate,
+            BleAddrType::Multicast,
+        ];
+        for variant in variants {
+            let db_str = variant.to_db();
+            let parsed = BleAddrType::from_db(db_str);
+            assert_eq!(parsed, Some(variant), "Round-trip failed for {db_str}");
+        }
+    }
+
+    #[test]
+    fn addr_type_from_db_invalid() {
+        assert_eq!(BleAddrType::from_db("garbage"), None);
+        assert_eq!(BleAddrType::from_db(""), None);
+    }
+
     // ── compute_fingerprint ──────────────────────────────────────────────
 
     #[test]
