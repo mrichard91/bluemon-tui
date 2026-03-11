@@ -14,6 +14,7 @@ pub enum ChatRole {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub raw_text: String,
@@ -131,11 +132,13 @@ impl ChatState {
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
     }
 
+    #[allow(dead_code)]
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
 
     /// Total rendered lines across all messages (including spacing).
+    #[allow(dead_code)]
     pub fn total_lines(&self) -> usize {
         let mut n = 0;
         for msg in &self.messages {

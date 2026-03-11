@@ -227,6 +227,7 @@ pub fn resolve_compact(uuids: &[String]) -> String {
 /// Format a UUID with its resolved name appended, if known.
 ///
 /// Returns `"uuid (Name)"` for known UUIDs, or just `"uuid"` for unknown ones.
+#[allow(dead_code)]
 pub fn format_uuid(uuid: &str) -> String {
     match resolve(uuid) {
         Some(name) => format!("{uuid} ({name})"),
