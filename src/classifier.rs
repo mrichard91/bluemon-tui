@@ -358,6 +358,8 @@ const SERVICE_UUID_PATTERNS: &[(&str, DeviceType)] = &[
     ("00001119", DeviceType::Printer),   // Reference Printing
     // Camera
     ("00001822", DeviceType::Camera),    // Camera Profile
+    // Vehicles
+    ("6f65732a", DeviceType::Vehicle),   // Rivian BLE
 ];
 
 /// Name substring patterns → DeviceType (checked case-insensitively)
@@ -370,7 +372,7 @@ const NAME_PATTERNS: &[(&[&str], DeviceType)] = &[
     (&["airpod", "buds", "earbuds", "headphone"], DeviceType::Audio),
     (&["homepod", "echo", "speaker"], DeviceType::Speaker),
     (&["tv", "roku", "firestick", "chromecast"], DeviceType::Tv),
-    (&["car", "vehicle", "model 3", "model y", "model s"], DeviceType::Vehicle),
+    (&["car", "vehicle", "model 3", "model y", "model s", "rivn"], DeviceType::Vehicle),
 ];
 
 /// Vendor substring patterns → DeviceType (checked case-insensitively)
