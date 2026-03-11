@@ -466,6 +466,33 @@ pub fn mac_rotation_stats(conn: &Connection, macs: &[String]) -> anyhow::Result<
     })
 }
 
+/// Load hourly activity counts for all devices, grouped by fingerprint.
+/// Returns a map of fingerprint (or MAC for unfingerprinted devices) → [u32; 24].
+pub fn bulk_hourly_activity(conn: &Connection) -> anyhow::Result<HashMap<String, [u32; 24]>> {
+    let mut result: HashMap<String, [u32; 24]> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT d.fingerprint, d.mac,
+                CAST(strftime('%H', o.seen_at, 'localtime') AS INTEGER) AS hour,
+                COUNT(*) AS cnt
+         FROM observations o
+         JOIN devices d ON o.mac = d.mac
+         GROUP BY d.mac, hour"
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let fp: String = row.get(0)?;
+        let mac: String = row.get(1)?;
+        let hour: u32 = row.get(2)?;
+        let cnt: u32 = row.get(3)?;
+        let key = if fp.is_empty() { mac } else { fp };
+        if (hour as usize) < 24 {
+            let entry = result.entry(key).or_insert([0u32; 24]);
+            entry[hour as usize] += cnt;
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

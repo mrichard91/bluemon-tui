@@ -11,7 +11,7 @@ mod tui;
 mod vendor;
 
 use app::App;
-use chrono::Local;
+use chrono::{Local, Timelike};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -131,6 +131,7 @@ async fn run(
                 }
             }
             app.rebuild_fingerprint_groups();
+            app.hourly_cache = db::bulk_hourly_activity(&conn).unwrap_or_default();
             app.rebuild_sorted_list();
         }
         Err(e) => eprintln!("Warning: failed to load devices from DB: {e}"),
@@ -307,6 +308,19 @@ async fn run(
                 ScanMessage::CycleComplete => {
                     app.scan_count += 1;
                     if !pending_obs.is_empty() {
+                        // Increment hourly cache for observed fingerprints
+                        let hour = Local::now().hour() as usize;
+                        for obs in &pending_obs {
+                            if let Some(dev) = app.devices.get(&obs.mac) {
+                                let key = if dev.fingerprint.is_empty() {
+                                    obs.mac.clone()
+                                } else {
+                                    dev.fingerprint.clone()
+                                };
+                                let entry = app.hourly_cache.entry(key).or_insert([0u32; 24]);
+                                entry[hour] += 1;
+                            }
+                        }
                         let _ = db::write_cycle(&conn, &app.devices, &pending_obs);
                         pending_obs.clear();
                     }

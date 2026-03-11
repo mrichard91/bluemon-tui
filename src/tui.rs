@@ -146,6 +146,11 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         ),
         header_cell(SortColumn::FirstSeen, sc, asc),
         header_cell(SortColumn::LastSeen, sc, asc),
+        Cell::from("Activity 0h        23h").style(
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
         Cell::from("Note").style(
             Style::default()
                 .fg(Color::White)
@@ -158,8 +163,8 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     let rows: Vec<Row> = app
         .display_list
         .iter()
-        .filter_map(|fp| app.aggregated.get(fp))
-        .map(|d: &AggregatedDevice| {
+        .filter_map(|fp| app.aggregated.get(fp).map(|d| (fp, d)))
+        .map(|(fp, d): (&String, &AggregatedDevice)| {
             let type_color = d.device_type.color();
 
             // MAC column: abbreviated to first 4 octets
@@ -194,6 +199,11 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
                 Color::DarkGray
             };
 
+            // Hourly activity sparkline
+            let activity = app.hourly_cache.get(fp)
+                .map(|counts| crate::app::format_hourly_sparkline(counts))
+                .unwrap_or_default();
+
             Row::new(vec![
                 Cell::from(dist_str).style(Style::default().fg(dist_c)),
                 Cell::from(d.device_type.icon()).style(Style::default().fg(type_color)),
@@ -206,6 +216,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(d.fingerprint.clone()).style(Style::default().fg(fp_color)),
                 Cell::from(format_compact(d.first_seen)),
                 Cell::from(format_relative(d.last_seen)),
+                Cell::from(activity).style(Style::default().fg(Color::Magenta)),
                 Cell::from(note_display).style(Style::default().fg(Color::White)),
             ])
             .style(Style::default().fg(type_color))
@@ -224,6 +235,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(8),  // FP
         Constraint::Length(13), // First Seen
         Constraint::Length(8),  // Last Seen
+        Constraint::Length(24), // Activity
         Constraint::Min(6),    // Note
     ];
 

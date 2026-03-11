@@ -173,6 +173,8 @@ pub struct App {
     pub detail_rssi_history: Vec<i16>,
     pub detail_hourly: [u32; 24],
     pub detail_rotation: Option<crate::db::MacRotationStats>,
+    /// Per-fingerprint hourly activity for the table sparkline column.
+    pub hourly_cache: HashMap<String, [u32; 24]>,
 }
 
 impl App {
@@ -203,6 +205,7 @@ impl App {
             detail_rssi_history: Vec::new(),
             detail_hourly: [0; 24],
             detail_rotation: None,
+            hourly_cache: HashMap::new(),
         }
     }
 
@@ -615,6 +618,23 @@ pub fn format_uptime(start: DateTime<Local>) -> String {
     format!("{h}:{m:02}:{s:02}")
 }
 
+/// Render a 24-char hourly activity sparkline from counts per hour (0–23).
+pub fn format_hourly_sparkline(counts: &[u32; 24]) -> String {
+    let max = *counts.iter().max().unwrap_or(&0) as f64;
+    if max == 0.0 {
+        return String::new();
+    }
+    let bars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+    counts.iter().map(|&c| {
+        if c == 0 {
+            ' '
+        } else {
+            let norm = (c as f64 / max * 8.0) as usize;
+            bars[norm.clamp(1, 8)]
+        }
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,6 +856,34 @@ mod tests {
         app.note_input = "".into();
         app.save_note();
         assert!(app.devices["AA:BB:CC:DD:EE:FF"].note.is_none());
+    }
+
+    // ── format_hourly_sparkline ───────────────────────────────────────────
+
+    #[test]
+    fn sparkline_empty_counts() {
+        assert_eq!(format_hourly_sparkline(&[0; 24]), "");
+    }
+
+    #[test]
+    fn sparkline_single_hour() {
+        let mut counts = [0u32; 24];
+        counts[10] = 5;
+        let s = format_hourly_sparkline(&counts);
+        assert_eq!(s.chars().count(), 24);
+        // Hour 10 should be full bar, others should be spaces
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars[10], '\u{2588}');
+        assert_eq!(chars[0], ' ');
+    }
+
+    #[test]
+    fn sparkline_all_equal() {
+        let counts = [10u32; 24];
+        let s = format_hourly_sparkline(&counts);
+        assert_eq!(s.chars().count(), 24);
+        // All bars should be full height
+        assert!(s.chars().all(|c| c == '\u{2588}'));
     }
 
     #[test]
