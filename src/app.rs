@@ -7,7 +7,20 @@ use crate::{continuity, fast_pair};
 use chrono::{DateTime, Datelike, Local};
 use ratatui::widgets::TableState;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 use tokio::sync::mpsc;
+
+/// Path loss exponent for log-distance model. Higher = faster signal decay.
+/// - 2.0: free space (outdoors, line-of-sight)
+/// - 3.0: typical indoor (default)
+/// - 3.5–4.0: dense indoor (multiple walls/floors)
+/// Override via BLE_PATH_LOSS_N in .env.
+static PATH_LOSS_N: LazyLock<f64> = LazyLock::new(|| {
+    std::env::var("BLE_PATH_LOSS_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3.0)
+});
 
 #[derive(Clone)]
 pub struct DeviceInfo {
@@ -97,23 +110,19 @@ impl SortColumn {
 
 /// Estimate distance in meters from RSSI using log-distance path loss model.
 ///
-/// Priority for reference power at 1m:
-/// 1. iBeacon measured_power (already calibrated at 1m, used directly)
-/// 2. BLE tx_power (adjusted by -40 dB for free-space path loss at 1m / 2.4 GHz)
-/// 3. Default -59 dBm
+/// Reference power at 1m:
+/// - iBeacon measured_power is used directly (already calibrated at 1m).
+/// - BLE tx_power is the transmitter output power, NOT a calibrated 1m RSSI,
+///   so we ignore it and fall back to the default.
+/// - Default: -59 dBm (typical BLE received power at 1m).
 ///
 /// Formula: distance = 10 ^ ((ref_power - rssi) / (10 * n))
-pub fn estimate_distance(rssi: i16, tx_power: Option<i16>, ibeacon_power: Option<i8>) -> f64 {
-    let ref_power = if let Some(ibp) = ibeacon_power {
-        ibp as f64
-    } else {
-        match tx_power {
-            Some(tp) => tp as f64 - 40.0,
-            None => -59.0,
-        }
+pub fn estimate_distance(rssi: i16, _tx_power: Option<i16>, ibeacon_power: Option<i8>) -> f64 {
+    let ref_power = match ibeacon_power {
+        Some(ibp) => ibp as f64,
+        None => -59.0,
     };
-    const PATH_LOSS_N: f64 = 2.5;
-    10_f64.powf((ref_power - rssi as f64) / (10.0 * PATH_LOSS_N))
+    10_f64.powf((ref_power - rssi as f64) / (10.0 * *PATH_LOSS_N))
 }
 
 /// Format estimated distance for display.
@@ -592,10 +601,11 @@ mod tests {
     }
 
     #[test]
-    fn distance_custom_tx_power() {
-        // tx_power=0 → ref = 0 - 40 = -40; rssi=-40 → distance ~1m
-        let d = estimate_distance(-40, Some(0), None);
-        assert!((d - 1.0).abs() < 0.01);
+    fn distance_tx_power_ignored() {
+        // tx_power is not calibrated at 1m, so it should be ignored (uses default -59)
+        let d_with_tx = estimate_distance(-59, Some(12), None);
+        let d_without_tx = estimate_distance(-59, None, None);
+        assert!((d_with_tx - d_without_tx).abs() < 0.01, "tx_power should not affect distance");
     }
 
     #[test]
