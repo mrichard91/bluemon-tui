@@ -32,7 +32,13 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
              seen_at TEXT NOT NULL,
              rssi INTEGER,
              name TEXT,
-             service_uuids TEXT DEFAULT ''
+             service_uuids TEXT DEFAULT '',
+             fingerprint TEXT DEFAULT ''
+         );
+
+         CREATE TABLE IF NOT EXISTS app_settings (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL DEFAULT ''
          );
 
          CREATE INDEX IF NOT EXISTS idx_obs_mac ON observations(mac);
@@ -84,6 +90,12 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
         .is_err()
     {
         conn.execute_batch("ALTER TABLE devices ADD COLUMN addr_type TEXT DEFAULT '';")?;
+    }
+    if conn
+        .prepare("SELECT fingerprint FROM observations LIMIT 0")
+        .is_err()
+    {
+        conn.execute_batch("ALTER TABLE observations ADD COLUMN fingerprint TEXT DEFAULT '';")?;
     }
 
     seed_reference_data(&conn)?;
@@ -254,6 +266,7 @@ pub struct PendingObs {
     pub rssi: Option<i16>,
     pub name: Option<String>,
     pub service_uuids: String,
+    pub fingerprint: String,
 }
 
 /// Write a full scan cycle to the database in a single transaction:
@@ -268,11 +281,18 @@ pub fn write_cycle(
 
     {
         let mut obs_stmt = tx.prepare_cached(
-            "INSERT INTO observations (mac, seen_at, rssi, name, service_uuids)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO observations (mac, seen_at, rssi, name, service_uuids, fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for obs in observations {
-            obs_stmt.execute(params![obs.mac, now, obs.rssi, obs.name, obs.service_uuids])?;
+            obs_stmt.execute(params![
+                obs.mac,
+                now,
+                obs.rssi,
+                obs.name,
+                obs.service_uuids,
+                obs.fingerprint,
+            ])?;
         }
     }
 
@@ -359,11 +379,54 @@ pub fn update_gatt_info(
     Ok(())
 }
 
-pub fn update_note(conn: &Connection, mac: &str, note: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "UPDATE devices SET note = ?1 WHERE mac = ?2",
-        params![note, mac],
-    )?;
+pub fn update_note_group(
+    conn: &Connection,
+    fingerprint: Option<&str>,
+    mac: &str,
+    note: &str,
+) -> anyhow::Result<()> {
+    if let Some(fp) = fingerprint {
+        conn.execute(
+            "UPDATE devices SET note = ?1 WHERE fingerprint = ?2",
+            params![note, fp],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE devices SET note = ?1 WHERE mac = ?2",
+            params![note, mac],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn load_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT value FROM app_settings WHERE key = ?1")?;
+    let mut rows = stmt.query(params![key])?;
+    if let Some(row) = rows.next()? {
+        let value: String = row.get(0)?;
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn save_setting(conn: &Connection, key: &str, value: Option<&str>) -> anyhow::Result<()> {
+    match value.filter(|v| !v.is_empty()) {
+        Some(value) => {
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        None => {
+            conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+        }
+    }
     Ok(())
 }
 
@@ -471,12 +534,11 @@ pub fn mac_rotation_stats(conn: &Connection, macs: &[String]) -> anyhow::Result<
 pub fn bulk_hourly_activity(conn: &Connection) -> anyhow::Result<HashMap<String, [u32; 24]>> {
     let mut result: HashMap<String, [u32; 24]> = HashMap::new();
     let mut stmt = conn.prepare(
-        "SELECT d.fingerprint, d.mac,
+        "SELECT o.fingerprint, o.mac,
                 CAST(strftime('%H', o.seen_at, 'localtime') AS INTEGER) AS hour,
                 COUNT(*) AS cnt
          FROM observations o
-         JOIN devices d ON o.mac = d.mac
-         GROUP BY d.mac, hour"
+         GROUP BY COALESCE(NULLIF(o.fingerprint, ''), o.mac), hour"
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -567,6 +629,7 @@ mod tests {
             rssi: Some(-65),
             name: Some("TestDevice".into()),
             service_uuids: "0000180a,0000180f".into(),
+            fingerprint: "A1B2".into(),
         }];
 
         write_cycle(&conn, &devices, &observations).unwrap();
@@ -598,8 +661,8 @@ mod tests {
         devices.insert("MAC2".into(), make_test_device("MAC2"));
 
         let observations = vec![
-            PendingObs { mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new() },
-            PendingObs { mac: "MAC2".into(), rssi: Some(-70), name: None, service_uuids: String::new() },
+            PendingObs { mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(), fingerprint: "A1B2".into() },
+            PendingObs { mac: "MAC2".into(), rssi: Some(-70), name: None, service_uuids: String::new(), fingerprint: "A1B2".into() },
         ];
 
         write_cycle(&conn, &devices, &observations).unwrap();
@@ -607,7 +670,7 @@ mod tests {
         assert_eq!(loaded.len(), 2);
     }
 
-    // ── update_note ──────────────────────────────────────────────────────
+    // ── update_note_group ────────────────────────────────────────────────
 
     #[test]
     fn update_note_persists() {
@@ -615,11 +678,11 @@ mod tests {
         let mut devices = HashMap::new();
         devices.insert("MAC1".into(), make_test_device("MAC1"));
         let obs = vec![PendingObs {
-            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(),
+            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(), fingerprint: "A1B2".into(),
         }];
         write_cycle(&conn, &devices, &obs).unwrap();
 
-        update_note(&conn, "MAC1", "updated note").unwrap();
+        update_note_group(&conn, Some("A1B2"), "MAC1", "updated note").unwrap();
 
         let loaded = load_devices(&conn).unwrap();
         assert_eq!(loaded["MAC1"].note.as_deref(), Some("updated note"));
@@ -633,7 +696,7 @@ mod tests {
         let mut devices = HashMap::new();
         devices.insert("MAC1".into(), make_test_device("MAC1"));
         let obs = vec![PendingObs {
-            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(),
+            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(), fingerprint: "A1B2".into(),
         }];
         write_cycle(&conn, &devices, &obs).unwrap();
 
@@ -661,7 +724,7 @@ mod tests {
         let mut devices = HashMap::new();
         devices.insert(mac.to_string(), make_test_device(mac));
         let obs = vec![PendingObs {
-            mac: mac.to_string(), rssi: Some(-60), name: None, service_uuids: String::new(),
+            mac: mac.to_string(), rssi: Some(-60), name: None, service_uuids: String::new(), fingerprint: "A1B2".into(),
         }];
         write_cycle(conn, &devices, &obs).unwrap();
 
@@ -711,7 +774,7 @@ mod tests {
         let mut devices = HashMap::new();
         devices.insert("MAC1".to_string(), make_test_device("MAC1"));
         let obs = vec![PendingObs {
-            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(),
+            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(), fingerprint: "A1B2".into(),
         }];
         write_cycle(&conn, &devices, &obs).unwrap();
 
@@ -744,7 +807,7 @@ mod tests {
         let mut devices = HashMap::new();
         devices.insert("MAC1".to_string(), make_test_device("MAC1"));
         let obs = vec![PendingObs {
-            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(),
+            mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(), fingerprint: "A1B2".into(),
         }];
         write_cycle(&conn, &devices, &obs).unwrap();
 
@@ -768,8 +831,8 @@ mod tests {
         devices.insert("MAC1".to_string(), d1);
         devices.insert("MAC2".to_string(), d2);
         let obs = vec![
-            PendingObs { mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new() },
-            PendingObs { mac: "MAC2".into(), rssi: Some(-60), name: None, service_uuids: String::new() },
+            PendingObs { mac: "MAC1".into(), rssi: Some(-60), name: None, service_uuids: String::new(), fingerprint: "A1B2".into() },
+            PendingObs { mac: "MAC2".into(), rssi: Some(-60), name: None, service_uuids: String::new(), fingerprint: "A1B2".into() },
         ];
         write_cycle(&conn, &devices, &obs).unwrap();
 

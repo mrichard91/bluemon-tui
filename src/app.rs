@@ -156,6 +156,8 @@ pub struct App {
     pub note_mode: bool,
     pub note_input: String,
     pub note_mac: String, // MAC of device being noted
+    pub api_key_mode: bool,
+    pub api_key_input: String,
     pub scan_count: u32,
     pub start_time: DateTime<Local>,
     pub scanning: bool,
@@ -191,6 +193,8 @@ impl App {
             note_mode: false,
             note_input: String::new(),
             note_mac: String::new(),
+            api_key_mode: false,
+            api_key_input: String::new(),
             scan_count: 0,
             start_time: Local::now(),
             scanning: true,
@@ -524,18 +528,53 @@ impl App {
         self.note_mode = false;
         let mac = std::mem::take(&mut self.note_mac);
         let note = std::mem::take(&mut self.note_input);
-        if let Some(d) = self.devices.get_mut(&mac) {
-            d.note = if note.is_empty() { None } else { Some(note) };
-            Some(mac)
-        } else {
-            None
+
+        let note_value = if note.is_empty() { None } else { Some(note) };
+        let group_key = self.devices.get(&mac).map(|d| {
+            if d.fingerprint.is_empty() {
+                mac.clone()
+            } else {
+                d.fingerprint.clone()
+            }
+        })?;
+
+        if let Some(macs) = self.fingerprint_groups.get(&group_key).cloned() {
+            for group_mac in macs {
+                if let Some(d) = self.devices.get_mut(&group_mac) {
+                    d.note = note_value.clone();
+                }
+            }
         }
+        Some(mac)
     }
 
     pub fn cancel_note(&mut self) {
         self.note_mode = false;
         self.note_input.clear();
         self.note_mac.clear();
+    }
+
+    pub fn enter_api_key_mode(&mut self) {
+        self.api_key_mode = true;
+        self.api_key_input.clear();
+    }
+
+    pub fn save_api_key(&mut self) -> Option<Option<String>> {
+        self.api_key_mode = false;
+        let key = std::mem::take(&mut self.api_key_input);
+        let trimmed = key.trim().to_string();
+        if trimmed.is_empty() {
+            self.chat.set_api_key(None);
+            Some(None)
+        } else {
+            self.chat.set_api_key(Some(trimmed.clone()));
+            Some(Some(trimmed))
+        }
+    }
+
+    pub fn cancel_api_key(&mut self) {
+        self.api_key_mode = false;
+        self.api_key_input.clear();
     }
 
     pub fn scroll_down(&mut self) {

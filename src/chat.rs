@@ -1,8 +1,12 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use rusqlite::{Connection, OpenFlags};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::mpsc;
+
+const DEFAULT_CHAT_MODEL: &str = "gpt-5.4";
+const DEFAULT_SQL_MAX_ROWS: usize = 500;
+const MAX_SQL_MAX_ROWS: usize = 5000;
 
 // ── Data types ──────────────────────────────────────────────────────────
 
@@ -24,7 +28,7 @@ pub struct ChatMessage {
 pub enum ChatEvent {
     AssistantMessage {
         text: String,
-        response_id: Option<String>,
+        history: Vec<serde_json::Value>,
     },
     Error(String),
 }
@@ -38,15 +42,24 @@ pub struct ChatState {
     pub waiting: bool,
     tx: mpsc::UnboundedSender<ChatEvent>,
     rx: mpsc::UnboundedReceiver<ChatEvent>,
-    previous_response_id: Option<String>,
+    history: Vec<serde_json::Value>,
     api_key: Option<String>,
     db_path: String,
+    model: String,
 }
 
 impl ChatState {
     pub fn new(db_path: String) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let api_key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty());
+        let api_key = load_api_key_from_db(&db_path).or_else(|| {
+            std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+        });
+        let model = std::env::var("OPENAI_MODEL")
+            .ok()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string());
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -54,10 +67,19 @@ impl ChatState {
             waiting: false,
             tx,
             rx,
-            previous_response_id: None,
+            history: Vec::new(),
             api_key,
             db_path,
+            model,
         }
+    }
+
+    pub fn has_api_key(&self) -> bool {
+        self.api_key.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
+    pub fn set_api_key(&mut self, key: Option<String>) {
+        self.api_key = key.filter(|k| !k.is_empty());
     }
 
     pub fn send_message(&mut self) {
@@ -70,9 +92,9 @@ impl ChatState {
             None => {
                 self.messages.push(ChatMessage {
                     role: ChatRole::System,
-                    raw_text: "Set OPENAI_API_KEY environment variable to use chat.".into(),
+                    raw_text: "Press K to set an OpenAI API key in the TUI.".into(),
                     rendered: render_system_message(
-                        "Set OPENAI_API_KEY environment variable to use chat.",
+                        "Press K to set an OpenAI API key in the TUI.",
                     ),
                 });
                 return;
@@ -91,10 +113,11 @@ impl ChatState {
 
         let tx = self.tx.clone();
         let db_path = self.db_path.clone();
-        let prev_id = self.previous_response_id.clone();
+        let history = self.history.clone();
+        let model = self.model.clone();
 
         tokio::spawn(async move {
-            let event = run_chat_turn(&api_key, &db_path, &text, prev_id).await;
+            let event = run_chat_turn(&api_key, &model, &db_path, &text, history).await;
             let _ = tx.send(event);
         });
     }
@@ -102,8 +125,8 @@ impl ChatState {
     pub fn drain_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                ChatEvent::AssistantMessage { text, response_id } => {
-                    self.previous_response_id = response_id;
+                ChatEvent::AssistantMessage { text, history } => {
+                    self.history = history;
                     self.messages.push(ChatMessage {
                         role: ChatRole::Assistant,
                         raw_text: text.clone(),
@@ -151,31 +174,28 @@ impl ChatState {
     }
 }
 
+fn load_api_key_from_db(db_path: &str) -> Option<String> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM app_settings WHERE key = 'openai_api_key'")
+        .ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    let row = rows.next().ok()??;
+    let value: String = row.get(0).ok()?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 // ── OpenAI Responses API types ──────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ApiRequest {
-    model: &'static str,
-    instructions: String,
-    input: serde_json::Value,
-    tools: Vec<ToolDef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_response_id: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct ToolDef {
-    r#type: &'static str,
-    name: &'static str,
-    description: &'static str,
-    parameters: serde_json::Value,
-}
 
 #[derive(Deserialize)]
 struct ApiResponse {
     id: Option<String>,
     #[serde(default)]
-    output: Vec<OutputItem>,
+    output: Vec<serde_json::Value>,
     #[serde(default)]
     error: Option<ApiError>,
 }
@@ -200,6 +220,13 @@ struct OutputItem {
 struct ContentPart {
     r#type: Option<String>,
     text: Option<String>,
+}
+
+fn user_message_item(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "user",
+        "content": text
+    })
 }
 
 // ── Async API call ──────────────────────────────────────────────────────
@@ -235,12 +262,13 @@ CREATE TABLE observations (
     seen_at TEXT NOT NULL,          -- RFC3339 local datetime
     rssi INTEGER,                   -- signal strength in dBm (closer to 0 = stronger/nearer)
     name TEXT,
-    service_uuids TEXT DEFAULT ''   -- Comma-separated
+    service_uuids TEXT DEFAULT '',  -- Comma-separated
+    fingerprint TEXT DEFAULT ''     -- fingerprint at observation time
 );
 
 Indexes: idx_obs_mac(mac), idx_obs_seen(seen_at)
 
-device_type values: phone, tablet, laptop, computer, watch, audio, speaker, tv, vehicle, smart_home, wearable, gaming, camera, printer, network, unknown
+device_type values: phone, tablet, laptop, computer, watch, audio, speaker, tv, vehicle, smart, wearable, gaming, camera, printer, network, unknown
 
 ## Enrichment Columns
 
@@ -296,42 +324,60 @@ Use these names when presenting service UUID data to the user.
 
 ## Instructions
 
-Use the run_sql tool to query the database. Format responses as markdown with tables for tabular data. Be concise.
-Only SELECT queries are allowed."#
+Use `run_sql` for database access. Use `code_interpreter` for multi-step analysis, anomaly scoring, or summarizing large SQL results. Use `web_search` only when external current facts are necessary.
+Prefer SQL aggregation over dumping raw rows. If you need CTEs, `WITH ... SELECT ...` queries are allowed. Format responses as markdown with tables for tabular data. Be concise and cite web sources when you use web search."#
     )
 }
 
-fn build_tools() -> Vec<ToolDef> {
-    vec![ToolDef {
-        r#type: "function",
-        name: "run_sql",
-        description: "Execute a read-only SQL SELECT query against the Bluetooth scan database. Returns JSON with {\"row_count\": N, \"rows\": [{column: value, ...}, ...]} on success, or {\"error\": \"message\"} on failure. Results are capped at 200 rows. Use SQLite syntax including datetime(), time(), date(), strftime(), julianday() for timestamp operations. Only SELECT statements are allowed.",
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "A SQLite SELECT query. Timestamps are RFC3339 strings (e.g. '2025-06-15T14:30:00+01:00'). Use datetime(), time(), strftime() for time operations. Use datetime('now','localtime') for current time."
-                }
-            },
-            "required": ["query"],
-            "additionalProperties": false
+fn build_tools() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "name": "run_sql",
+            "description": "Execute a read-only SQLite query against the Bluetooth scan database. Returns JSON with row_count, rows, truncated, and max_rows on success, or an error field on failure. Only SELECT queries and WITH...SELECT queries are allowed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A single SQLite SELECT query. CTEs using WITH are allowed. Timestamps are RFC3339 strings with timezone offsets."
+                    },
+                    "max_rows": {
+                        "type": "integer",
+                        "description": "Optional maximum rows to return. Defaults to 500 and is capped at 5000.",
+                        "minimum": 1,
+                        "maximum": 5000
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
         }),
-    }]
+        serde_json::json!({
+            "type": "code_interpreter",
+            "container": {
+                "type": "auto",
+                "memory_limit": "4g"
+            }
+        }),
+        serde_json::json!({
+            "type": "web_search"
+        }),
+    ]
 }
 
 async fn run_chat_turn(
     api_key: &str,
+    model: &str,
     db_path: &str,
     user_text: &str,
-    previous_response_id: Option<String>,
+    history: Vec<serde_json::Value>,
 ) -> ChatEvent {
     let client = reqwest::Client::new();
     let tools = build_tools();
 
-    // First request: user message as input
-    let mut input = serde_json::json!(user_text);
-    let mut prev_id = previous_response_id;
+    let mut context = history;
+    context.push(user_message_item(user_text));
     let mut iterations = 0;
     const MAX_ITERATIONS: usize = 10;
 
@@ -341,38 +387,21 @@ async fn run_chat_turn(
             return ChatEvent::Error("Too many tool-call iterations, stopping.".into());
         }
 
-        let body = ApiRequest {
-            model: "gpt-4.1-nano",
-            instructions: build_system_prompt(),
-            input,
-            tools: tools.clone(),
-            previous_response_id: prev_id.clone(),
-        };
+        let body = serde_json::json!({
+            "model": model,
+            "instructions": build_system_prompt(),
+            "input": context,
+            "tools": tools,
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+            "parallel_tool_calls": true,
+            "reasoning": { "effort": "medium" },
+            "text": { "verbosity": "low" }
+        });
 
-        let resp = match client
-            .post("https://api.openai.com/v1/responses")
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return ChatEvent::Error(format!("Network error: {e}")),
-        };
-
-        let status = resp.status();
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => return ChatEvent::Error(format!("Failed to read response: {e}")),
-        };
-
-        if !status.is_success() {
-            return ChatEvent::Error(format!("API error ({status}): {text}"));
-        }
-
-        let api_resp: ApiResponse = match serde_json::from_str(&text) {
-            Ok(r) => r,
-            Err(e) => return ChatEvent::Error(format!("Failed to parse API response: {e}")),
+        let api_resp = match create_response(&client, api_key, &body).await {
+            Ok(resp) => resp,
+            Err(err) => return ChatEvent::Error(err),
         };
 
         if let Some(err) = &api_resp.error {
@@ -382,56 +411,26 @@ async fn run_chat_turn(
             ));
         }
 
-        let response_id = api_resp.id.clone();
-
-        // Check output items for function calls vs message
-        let mut has_function_call = false;
+        let mut function_calls = Vec::new();
+        let mut text_parts: Vec<String> = Vec::new();
         let mut tool_outputs: Vec<serde_json::Value> = Vec::new();
 
-        for item in &api_resp.output {
+        for raw_item in &api_resp.output {
+            let Ok(item) = serde_json::from_value::<OutputItem>(raw_item.clone()) else {
+                continue;
+            };
             match item.r#type.as_deref() {
                 Some("function_call") => {
-                    has_function_call = true;
-                    let call_id = item.call_id.as_deref().unwrap_or("");
-                    let name = item.name.as_deref().unwrap_or("");
-
-                    if name == "run_sql" {
-                        let args_str = item.arguments.as_deref().unwrap_or("{}");
-                        let result = match serde_json::from_str::<serde_json::Value>(args_str) {
-                            Ok(args) => {
-                                let query = args
-                                    .get("query")
-                                    .and_then(|q| q.as_str())
-                                    .unwrap_or("");
-                                execute_readonly_sql(db_path, query)
-                            }
-                            Err(e) => format!("{{\"error\": \"Invalid arguments: {e}\"}}")
-                        };
-
-                        tool_outputs.push(serde_json::json!({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": result,
-                        }));
-                    }
+                    function_calls.push(item);
                 }
                 Some("message") => {
-                    // Extract text from content parts
                     if let Some(content) = &item.content {
-                        let mut text_parts = Vec::new();
                         for part in content {
                             if part.r#type.as_deref() == Some("output_text") {
                                 if let Some(t) = &part.text {
-                                    text_parts.push(t.as_str());
+                                    text_parts.push(t.clone());
                                 }
                             }
-                        }
-                        let full_text = text_parts.join("");
-                        if !full_text.is_empty() {
-                            return ChatEvent::AssistantMessage {
-                                text: full_text,
-                                response_id,
-                            };
                         }
                     }
                 }
@@ -439,37 +438,106 @@ async fn run_chat_turn(
             }
         }
 
-        if has_function_call && !tool_outputs.is_empty() {
-            // Send tool outputs back, continue loop
-            input = serde_json::Value::Array(tool_outputs);
-            prev_id = response_id;
+        if !function_calls.is_empty() {
+            context.extend(api_resp.output.iter().cloned());
+
+            for item in function_calls {
+                let call_id = item.call_id.as_deref().unwrap_or("");
+                let name = item.name.as_deref().unwrap_or("");
+
+                if name == "run_sql" {
+                    let args_str = item.arguments.as_deref().unwrap_or("{}");
+                    let result = match serde_json::from_str::<serde_json::Value>(args_str) {
+                        Ok(args) => {
+                            let query = args
+                                .get("query")
+                                .and_then(|q| q.as_str())
+                                .unwrap_or("");
+                            let max_rows = args
+                                .get("max_rows")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize);
+                            execute_readonly_sql(db_path, query, max_rows)
+                        }
+                        Err(e) => format!("{{\"error\": \"Invalid arguments: {e}\"}}")
+                    };
+
+                    tool_outputs.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": result,
+                    }));
+                }
+            }
+
+            context.extend(tool_outputs);
             continue;
         }
 
-        // No message and no function call — shouldn't happen, but handle it
+        let full_text = text_parts.join("");
+        context.extend(api_resp.output.iter().cloned());
+        if !full_text.is_empty() {
+            return ChatEvent::AssistantMessage {
+                text: full_text,
+                history: context,
+            };
+        }
+
         return ChatEvent::AssistantMessage {
             text: "(No response)".into(),
-            response_id,
+            history: context,
         };
     }
 }
 
+async fn create_response(
+    client: &reqwest::Client,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<ApiResponse, String> {
+    let resp = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {e}"))?;
+
+    if !status.is_success() {
+        return Err(format!("API error ({status}): {text}"));
+    }
+
+    serde_json::from_str(&text).map_err(|e| format!("Failed to parse API response: {e}"))
+}
+
 // ── SQL executor ────────────────────────────────────────────────────────
 
-fn execute_readonly_sql(db_path: &str, query: &str) -> String {
+fn execute_readonly_sql(db_path: &str, query: &str, max_rows: Option<usize>) -> String {
     let trimmed = query.trim();
 
-    // Only allow SELECT
-    if !trimmed
+    let first_word = trimmed
         .split_whitespace()
         .next()
-        .map_or(false, |w| w.eq_ignore_ascii_case("SELECT"))
-    {
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let is_allowed = matches!(first_word.as_str(), "SELECT" | "WITH");
+    if !is_allowed || trimmed.contains(';') {
         return serde_json::json!({
-            "error": "Only SELECT queries are allowed."
+            "error": "Only single SELECT queries or WITH...SELECT queries are allowed."
         })
         .to_string();
     }
+
+    let max_rows = max_rows
+        .unwrap_or(DEFAULT_SQL_MAX_ROWS)
+        .max(1)
+        .min(MAX_SQL_MAX_ROWS);
 
     let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(c) => c,
@@ -491,6 +559,7 @@ fn execute_readonly_sql(db_path: &str, query: &str) -> String {
         .collect();
 
     let mut rows = Vec::new();
+    let mut truncated = false;
     let result = stmt.query_map([], |row| {
         let mut obj = serde_json::Map::new();
         for (i, name) in col_names.iter().enumerate() {
@@ -518,7 +587,8 @@ fn execute_readonly_sql(db_path: &str, query: &str) -> String {
     match result {
         Ok(mapped) => {
             for row_result in mapped {
-                if rows.len() >= 200 {
+                if rows.len() >= max_rows {
+                    truncated = true;
                     break;
                 }
                 match row_result {
@@ -538,6 +608,8 @@ fn execute_readonly_sql(db_path: &str, query: &str) -> String {
     serde_json::json!({
         "row_count": rows.len(),
         "rows": rows,
+        "truncated": truncated,
+        "max_rows": max_rows,
     })
     .to_string()
 }
@@ -861,7 +933,7 @@ mod tests {
         let tmp_path = tmp.to_str().unwrap();
         let _conn = crate::db::open(tmp_path).unwrap();
 
-        let result = execute_readonly_sql(tmp_path, "SELECT COUNT(*) as cnt FROM devices");
+        let result = execute_readonly_sql(tmp_path, "SELECT COUNT(*) as cnt FROM devices", None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["row_count"], 1);
 
@@ -874,9 +946,9 @@ mod tests {
         let tmp_path = tmp.to_str().unwrap();
         let _conn = crate::db::open(tmp_path).unwrap();
 
-        let result = execute_readonly_sql(tmp_path, "DROP TABLE devices");
+        let result = execute_readonly_sql(tmp_path, "DROP TABLE devices", None);
         assert!(result.contains("error"));
-        assert!(result.contains("Only SELECT"));
+        assert!(result.contains("Only single SELECT queries"));
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -887,7 +959,7 @@ mod tests {
         let tmp_path = tmp.to_str().unwrap();
         let _conn = crate::db::open(tmp_path).unwrap();
 
-        let result = execute_readonly_sql(tmp_path, "SELECT * FROM nonexistent_table");
+        let result = execute_readonly_sql(tmp_path, "SELECT * FROM nonexistent_table", None);
         assert!(result.contains("error"));
 
         let _ = std::fs::remove_file(&tmp);
@@ -897,6 +969,7 @@ mod tests {
     fn sql_row_cap() {
         let tmp = std::env::temp_dir().join("bluemon_test_chat_cap.db");
         let tmp_path = tmp.to_str().unwrap();
+        let _ = std::fs::remove_file(&tmp);
         let conn = crate::db::open(tmp_path).unwrap();
 
         // Insert 210 devices
@@ -908,9 +981,11 @@ mod tests {
         }
         drop(conn);
 
-        let result = execute_readonly_sql(tmp_path, "SELECT * FROM devices");
+        let result = execute_readonly_sql(tmp_path, "SELECT * FROM devices", None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["row_count"], 200); // capped at 200
+        assert_eq!(parsed["row_count"], 210);
+        assert_eq!(parsed["max_rows"], super::DEFAULT_SQL_MAX_ROWS);
+        assert_eq!(parsed["truncated"], false);
 
         let _ = std::fs::remove_file(&tmp);
     }

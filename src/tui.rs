@@ -252,7 +252,27 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    if app.note_mode {
+    if app.api_key_mode {
+        let masked = if app.api_key_input.is_empty() {
+            String::new()
+        } else {
+            "*".repeat(app.api_key_input.len())
+        };
+        let spans = vec![
+            Span::styled(
+                " OpenAI Key ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(masked, Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::Yellow)),
+            Span::raw("  (Enter: save, Esc: cancel, blank clears)"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    } else if app.note_mode {
         let spans = vec![
             Span::styled(
                 " Note ",
@@ -281,7 +301,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     } else {
         f.render_widget(
             Paragraph::new(
-                "q:Quit  d:Detail  p:Probe  s/S:Sort  /:Filter  Enter:Note  e:CSV  E:JSON  j/k:Scroll",
+                "q:Quit  d:Detail  p:Probe  s/S:Sort  /:Filter  Enter:Note  K:API Key  e:CSV  E:JSON  j/k:Scroll",
             )
             .style(Style::default().fg(Color::DarkGray)),
             area,

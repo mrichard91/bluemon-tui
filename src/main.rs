@@ -21,6 +21,7 @@ use db::PendingObs;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use scanner::ScanMessage;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -158,7 +159,7 @@ async fn run(
         gatt::probe_loop(probe_adapter, probe_req_rx, probe_res_tx).await;
     });
 
-    let mut pending_obs: Vec<PendingObs> = Vec::new();
+    let mut pending_obs: HashMap<String, PendingObs> = HashMap::new();
 
     loop {
         terminal.draw(|f| tui::draw(f, &mut app))?;
@@ -179,7 +180,12 @@ async fn run(
                                     .get(&mac)
                                     .and_then(|d| d.note.as_deref())
                                     .unwrap_or("");
-                                let _ = db::update_note(&conn, &mac, note);
+                                let fingerprint = app
+                                    .devices
+                                    .get(&mac)
+                                    .map(|d| d.fingerprint.as_str())
+                                    .filter(|fp| !fp.is_empty());
+                                let _ = db::update_note_group(&conn, fingerprint, &mac, note);
                             }
                         }
                         KeyCode::Backspace => {
@@ -187,6 +193,32 @@ async fn run(
                         }
                         KeyCode::Char(c) => {
                             app.note_input.push(c);
+                        }
+                        _ => {}
+                    }
+                } else if app.api_key_mode {
+                    match key.code {
+                        KeyCode::Esc => app.cancel_api_key(),
+                        KeyCode::Enter => {
+                            if let Some(key_value) = app.save_api_key() {
+                                let _ = db::save_setting(
+                                    &conn,
+                                    "openai_api_key",
+                                    key_value.as_deref(),
+                                );
+                                let message = if key_value.is_some() {
+                                    "Saved OpenAI API key".to_string()
+                                } else {
+                                    "Cleared OpenAI API key".to_string()
+                                };
+                                app.probe_status = Some((message, Local::now()));
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.api_key_input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.api_key_input.push(c);
                         }
                         _ => {}
                     }
@@ -252,6 +284,9 @@ async fn run(
                         KeyCode::Char('c') => {
                             app.chat_mode = true;
                         }
+                        KeyCode::Char('K') => {
+                            app.enter_api_key_mode();
+                        }
                         KeyCode::Char('d') => {
                             if app.table_state.selected().is_some() {
                                 app.detail_mode = true;
@@ -297,11 +332,16 @@ async fn run(
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 ScanMessage::Result(result) => {
-                    pending_obs.push(PendingObs {
+                    pending_obs.insert(result.mac.clone(), PendingObs {
                         mac: result.mac.clone(),
                         rssi: result.rssi,
                         name: result.name.clone(),
                         service_uuids: result.service_uuids.join(","),
+                        fingerprint: if result.fingerprint.is_empty() {
+                            result.mac.clone()
+                        } else {
+                            result.fingerprint.clone()
+                        },
                     });
                     app.upsert_device(result);
                 }
@@ -310,19 +350,21 @@ async fn run(
                     if !pending_obs.is_empty() {
                         // Increment hourly cache for observed fingerprints
                         let hour = Local::now().hour() as usize;
-                        for obs in &pending_obs {
-                            if let Some(dev) = app.devices.get(&obs.mac) {
-                                let key = if dev.fingerprint.is_empty() {
-                                    obs.mac.clone()
-                                } else {
-                                    dev.fingerprint.clone()
-                                };
+                        let mut seen_fingerprints = HashSet::new();
+                        for obs in pending_obs.values() {
+                            let key = if obs.fingerprint.is_empty() {
+                                obs.mac.clone()
+                            } else {
+                                obs.fingerprint.clone()
+                            };
+                            if seen_fingerprints.insert(key.clone()) {
                                 let entry = app.hourly_cache.entry(key).or_insert([0u32; 24]);
                                 entry[hour] += 1;
                             }
                         }
-                        let _ = db::write_cycle(&conn, &app.devices, &pending_obs);
-                        pending_obs.clear();
+                        let observations: Vec<PendingObs> =
+                            pending_obs.drain().map(|(_, obs)| obs).collect();
+                        let _ = db::write_cycle(&conn, &app.devices, &observations);
                     }
                     app.rebuild_sorted_list();
                 }
