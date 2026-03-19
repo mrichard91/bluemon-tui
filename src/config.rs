@@ -7,13 +7,14 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 /// User-facing configuration.
+///
+/// API keys are intentionally excluded — use the K key in the TUI (persists to DB)
+/// or the OPENAI_API_KEY env var instead.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// OpenAI model for chat analysis.
     pub openai_model: String,
-    /// OpenAI API key (can also be set via K key in the TUI, or OPENAI_API_KEY env var).
-    pub openai_api_key: Option<String>,
     /// BLE adapter index (0 = first adapter).
     pub adapter: usize,
     /// Scan cycle duration in seconds.
@@ -27,7 +28,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             openai_model: "gpt-5.4-mini".to_string(),
-            openai_api_key: None,
             adapter: 0,
             scan_duration: 3,
             path_loss_n: 3.0,
@@ -60,11 +60,6 @@ pub fn load() -> Config {
             cfg.openai_model = model;
         }
     }
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        if !key.is_empty() {
-            cfg.openai_api_key = Some(key);
-        }
-    }
     if let Ok(n) = std::env::var("BLE_PATH_LOSS_N") {
         if let Ok(v) = n.parse::<f64>() {
             cfg.path_loss_n = v;
@@ -80,10 +75,10 @@ pub fn generate_template() -> String {
 # Place this file at ~/.config/bluemon-tui/config.toml
 
 # OpenAI model for chat analysis
-# model = "gpt-5.4-mini"
+# openai_model = "gpt-5.4-mini"
 
-# OpenAI API key (can also be set via K key in the TUI, or OPENAI_API_KEY env var)
-# openai_api_key = "sk-..."
+# OpenAI API key: set via K key in the TUI (saved to DB) or OPENAI_API_KEY env var.
+# Not stored in this file for security.
 
 # BLE adapter index (0 = first adapter)
 # adapter = 0
