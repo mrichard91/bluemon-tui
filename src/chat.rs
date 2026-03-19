@@ -24,6 +24,8 @@ pub enum ChatRole {
     User,
     Assistant,
     System,
+    /// Intermediate tool call status (dimmed, not an error).
+    ToolStatus,
 }
 
 #[derive(Clone)]
@@ -107,6 +109,7 @@ impl ChatState {
             ChatRole::User => render_user_message(&text),
             ChatRole::Assistant => render_assistant_message(&text),
             ChatRole::System => render_system_message(&text),
+            ChatRole::ToolStatus => render_tool_status(&text),
         };
         self.messages.push(ChatMessage {
             role,
@@ -159,7 +162,7 @@ impl ChatState {
                     self.scroll_offset = 0;
                 }
                 ChatEvent::Status(msg) => {
-                    self.push_message(ChatRole::System, msg);
+                    self.push_message(ChatRole::ToolStatus, msg);
                     // Still waiting — more events coming
                 }
                 ChatEvent::Error(err) => {
@@ -465,12 +468,12 @@ async fn run_chat_turn(
                     // Surface server-side tool usage (web_search, code_interpreter)
                     if let Some(t) = item.r#type.as_deref() {
                         let status = match t {
-                            "web_search_call" => Some("Searching the web...".to_string()),
-                            "code_interpreter_call" => Some("Running code analysis...".to_string()),
+                            "web_search_call" => Some("\u{25D0} Searching the web..."),
+                            "code_interpreter_call" => Some("\u{25D0} Running code analysis..."),
                             _ => None,
                         };
                         if let Some(msg) = status {
-                            let _ = tx.send(ChatEvent::Status(msg));
+                            let _ = tx.send(ChatEvent::Status(msg.to_string()));
                         }
                     }
                 }
@@ -484,29 +487,24 @@ async fn run_chat_turn(
                 let call_id = item.call_id.as_deref().unwrap_or("");
                 let name = item.name.as_deref().unwrap_or("");
 
-                // Surface tool call status to the UI
-                let status = match name {
-                    "run_sql" => {
-                        let query = item
-                            .arguments
-                            .as_deref()
-                            .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
-                            .and_then(|v| v.get("query").and_then(|q| q.as_str()).map(String::from))
-                            .unwrap_or_default();
-                        let short = if query.len() > 80 {
-                            format!("{}...", &query[..77])
-                        } else {
-                            query
-                        };
-                        format!("Running SQL: {short}")
-                    }
-                    _ => format!("Using tool: {name}"),
-                };
-                let _ = tx.send(ChatEvent::Status(status));
-
                 if name == "run_sql" {
                     let args_str = item.arguments.as_deref().unwrap_or("{}");
-                    let result = match serde_json::from_str::<serde_json::Value>(args_str) {
+                    let parsed = serde_json::from_str::<serde_json::Value>(args_str);
+                    let query_preview = parsed
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v.get("query").and_then(|q| q.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    let short = if query_preview.len() > 72 {
+                        format!("{}...", &query_preview[..69])
+                    } else {
+                        query_preview
+                    };
+
+                    let _ = tx.send(ChatEvent::Status(format!("\u{25D0} SQL: {short}")));
+
+                    let result = match parsed {
                         Ok(args) => {
                             let query = args
                                 .get("query")
@@ -521,11 +519,23 @@ async fn run_chat_turn(
                         Err(e) => format!("{{\"error\": \"Invalid arguments: {e}\"}}")
                     };
 
+                    // Parse row count from result for the completion message
+                    let row_info = serde_json::from_str::<serde_json::Value>(&result)
+                        .ok()
+                        .and_then(|v| v.get("row_count").and_then(|n| n.as_u64()))
+                        .map(|n| format!(" ({n} rows)"))
+                        .unwrap_or_default();
+                    let _ = tx.send(ChatEvent::Status(format!("\u{2713} SQL{row_info}: {short}")));
+
                     tool_outputs.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": result,
                     }));
+                } else {
+                    let _ = tx.send(ChatEvent::Status(
+                        format!("\u{25D0} Using tool: {name}"),
+                    ));
                 }
             }
 
@@ -690,6 +700,20 @@ fn render_system_message(text: &str) -> Vec<Line<'static>> {
         text.to_string(),
         Style::default().fg(Color::Red),
     ))]
+}
+
+fn render_tool_status(text: &str) -> Vec<Line<'static>> {
+    // ◐ (spinner) is yellow, ✓ (done) is green, rest is dim
+    let (icon, rest) = text.split_at(text.find(' ').unwrap_or(text.len()));
+    let icon_color = if icon.contains('\u{2713}') {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+    vec![Line::from(vec![
+        Span::styled(icon.to_string(), Style::default().fg(icon_color)),
+        Span::styled(rest.to_string(), Style::default().fg(Color::DarkGray)),
+    ])]
 }
 
 fn render_assistant_message(text: &str) -> Vec<Line<'static>> {
