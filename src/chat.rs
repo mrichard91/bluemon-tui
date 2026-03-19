@@ -10,7 +10,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-const DEFAULT_CHAT_MODEL: &str = "gpt-5.4";
+const DEFAULT_CHAT_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_SQL_MAX_ROWS: usize = 500;
 const MAX_SQL_MAX_ROWS: usize = 5000;
 
