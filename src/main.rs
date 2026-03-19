@@ -279,8 +279,12 @@ async fn run(
                             app.chat.input.pop();
                         }
                         KeyCode::Char(c) => {
-                            if c == 'm' && app.chat.input.is_empty() && !app.chat.waiting {
-                                app.chat.cycle_model();
+                            if app.chat.input.is_empty() && !app.chat.waiting {
+                                match c {
+                                    'm' => app.chat.cycle_model(),
+                                    'r' => app.chat.cycle_reasoning(),
+                                    _ => app.chat.input.push(c),
+                                }
                             } else {
                                 app.chat.input.push(c);
                             }

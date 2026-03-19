@@ -700,6 +700,7 @@ fn draw_chat_input(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_chat_footer(f: &mut Frame, area: Rect, app: &App) {
     let model = app.chat.model();
+    let reasoning = app.chat.reasoning_effort();
     let spans = vec![
         Span::styled(
             format!(" {model} "),
@@ -709,7 +710,14 @@ fn draw_chat_footer(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "  Esc:Back  Enter:Send  m:Model  Up/Down:Scroll",
+            format!(" {reasoning} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  Esc:Back  Enter:Send  m:Model  r:Reasoning  Up/Down:Scroll",
             Style::default().fg(Color::DarkGray),
         ),
     ];

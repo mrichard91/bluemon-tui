@@ -15,6 +15,8 @@ use std::path::PathBuf;
 pub struct Config {
     /// OpenAI model for chat analysis.
     pub openai_model: String,
+    /// Reasoning effort level for chat: "low", "medium", or "high".
+    pub reasoning_effort: String,
     /// BLE adapter index (0 = first adapter).
     pub adapter: usize,
     /// Scan cycle duration in seconds.
@@ -28,6 +30,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             openai_model: "gpt-5.4-mini".to_string(),
+            reasoning_effort: "high".to_string(),
             adapter: 0,
             scan_duration: 3,
             path_loss_n: 3.0,
@@ -76,6 +79,9 @@ pub fn generate_template() -> String {
 
 # OpenAI model for chat analysis
 # openai_model = "gpt-5.4-mini"
+
+# Reasoning effort level: "low", "medium", or "high"
+# reasoning_effort = "high"
 
 # OpenAI API key: set via K key in the TUI (saved to DB) or OPENAI_API_KEY env var.
 # Not stored in this file for security.

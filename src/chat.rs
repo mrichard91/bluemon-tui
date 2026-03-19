@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 /// Available chat models, cycled via `m` key in chat mode.
 const AVAILABLE_MODELS: &[&str] = &["gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4"];
 
+/// Available reasoning effort levels, cycled via `r` key in chat mode.
+const REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
+
 const DEFAULT_SQL_MAX_ROWS: usize = 500;
 const MAX_SQL_MAX_ROWS: usize = 5000;
 
@@ -61,6 +64,7 @@ pub struct ChatState {
     api_key: Option<String>,
     db_path: String,
     model: String,
+    reasoning_effort: String,
 }
 
 impl ChatState {
@@ -73,6 +77,7 @@ impl ChatState {
                 .filter(|k| !k.is_empty())
         });
         let model = cfg.openai_model.clone();
+        let reasoning_effort = cfg.reasoning_effort.clone();
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -84,6 +89,7 @@ impl ChatState {
             api_key,
             db_path,
             model,
+            reasoning_effort,
         }
     }
 
@@ -104,6 +110,21 @@ impl ChatState {
             .unwrap_or(0);
         let next_idx = (current_idx + 1) % AVAILABLE_MODELS.len();
         self.model = AVAILABLE_MODELS[next_idx].to_string();
+    }
+
+    /// Current reasoning effort level for display.
+    pub fn reasoning_effort(&self) -> &str {
+        &self.reasoning_effort
+    }
+
+    /// Cycle to the next reasoning effort level.
+    pub fn cycle_reasoning(&mut self) {
+        let current_idx = REASONING_LEVELS
+            .iter()
+            .position(|&l| l == self.reasoning_effort)
+            .unwrap_or(0);
+        let next_idx = (current_idx + 1) % REASONING_LEVELS.len();
+        self.reasoning_effort = REASONING_LEVELS[next_idx].to_string();
     }
 
     fn push_message(&mut self, role: ChatRole, text: String) {
@@ -147,10 +168,12 @@ impl ChatState {
         let db_path = self.db_path.clone();
         let history = self.history.clone();
         let model = self.model.clone();
+        let reasoning = self.reasoning_effort.clone();
 
         tokio::spawn(async move {
             let event =
-                run_chat_turn(&api_key, &model, &db_path, &text, history, &tx).await;
+                run_chat_turn(&api_key, &model, &reasoning, &db_path, &text, history, &tx)
+                    .await;
             let _ = tx.send(event);
         });
     }
@@ -441,6 +464,7 @@ fn build_tools() -> Vec<serde_json::Value> {
 async fn run_chat_turn(
     api_key: &str,
     model: &str,
+    reasoning_effort: &str,
     db_path: &str,
     user_text: &str,
     history: Vec<serde_json::Value>,
@@ -468,7 +492,7 @@ async fn run_chat_turn(
             "store": false,
             "include": ["reasoning.encrypted_content"],
             "parallel_tool_calls": true,
-            "reasoning": { "effort": "medium" },
+            "reasoning": { "effort": reasoning_effort },
             "text": { "verbosity": "low" }
         });
 
