@@ -370,7 +370,7 @@ Use these names when presenting service UUID data to the user.
 
 ## Instructions
 
-Use `run_sql` for database access. Use `code_interpreter` for multi-step analysis, anomaly scoring, or summarizing large SQL results. Use `web_search` only when external current facts are necessary.
+Use `run_sql` for database access. Use `set_note` to add or update notes on devices (by MAC or fingerprint). Use `code_interpreter` for multi-step analysis, anomaly scoring, or summarizing large SQL results. Use `web_search` only when external current facts are necessary.
 Prefer SQL aggregation over dumping raw rows. If you need CTEs, `WITH ... SELECT ...` queries are allowed.
 
 **Formatting**: Responses are rendered in a terminal. Keep markdown tables narrow — abbreviate column headers, truncate long values, and limit to ~5 columns so they fit in ~80 chars. Use bullet lists instead of tables when there are only 1-2 columns. Be concise and cite web sources when you use web search."#
@@ -398,6 +398,30 @@ fn build_tools() -> Vec<serde_json::Value> {
                     }
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "name": "set_note",
+            "description": "Set or update the note on a device. Use a MAC address or fingerprint to identify the device. Setting note to empty string clears it. Use run_sql first to find the correct MAC/fingerprint if needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mac": {
+                        "type": "string",
+                        "description": "MAC address of the device (e.g. 'AA:BB:CC:DD:EE:FF')"
+                    },
+                    "fingerprint": {
+                        "type": "string",
+                        "description": "4-char hex fingerprint to update all MACs in the group (e.g. 'A1B2'). If provided, mac is ignored."
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "The note text to set on the device. Empty string clears the note."
+                    }
+                },
+                "required": ["note"],
                 "additionalProperties": false
             }
         }),
@@ -565,6 +589,29 @@ async fn run_chat_turn(
                         "call_id": call_id,
                         "output": result,
                     }));
+                } else if name == "set_note" {
+                    let args_str = item.arguments.as_deref().unwrap_or("{}");
+                    let result = match serde_json::from_str::<serde_json::Value>(args_str) {
+                        Ok(args) => execute_set_note(db_path, &args),
+                        Err(e) => error_json(format!("Invalid arguments: {e}")),
+                    };
+
+                    let ok = !result.contains("\"error\"");
+                    let icon = if ok { "\u{2713}" } else { "\u{2717}" };
+                    let note_preview = serde_json::from_str::<serde_json::Value>(args_str)
+                        .ok()
+                        .and_then(|v| v.get("note").and_then(|n| n.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    let _ = tx.send(ChatEvent::Status {
+                        id: call_id.to_string(),
+                        text: format!("{icon} Note: \"{note_preview}\""),
+                    });
+
+                    tool_outputs.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": result,
+                    }));
                 } else {
                     let _ = tx.send(ChatEvent::Status {
                         id: call_id.to_string(),
@@ -623,6 +670,48 @@ async fn create_response(
 
 fn error_json(msg: impl std::fmt::Display) -> String {
     serde_json::json!({ "error": msg.to_string() }).to_string()
+}
+
+fn execute_set_note(db_path: &str, args: &serde_json::Value) -> String {
+    let note = args
+        .get("note")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let fingerprint = args.get("fingerprint").and_then(|v| v.as_str());
+    let mac = args.get("mac").and_then(|v| v.as_str());
+
+    if fingerprint.is_none() && mac.is_none() {
+        return error_json("Either 'mac' or 'fingerprint' must be provided.");
+    }
+
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => return error_json(format!("DB open error: {e}")),
+    };
+
+    // If fingerprint is given, update all MACs with that fingerprint
+    // Otherwise update the single MAC
+    let result = if let Some(fp) = fingerprint {
+        conn.execute(
+            "UPDATE devices SET note = ?1 WHERE fingerprint = ?2",
+            rusqlite::params![note, fp],
+        )
+    } else {
+        conn.execute(
+            "UPDATE devices SET note = ?1 WHERE mac = ?2",
+            rusqlite::params![note, mac.unwrap()],
+        )
+    };
+
+    match result {
+        Ok(rows) => serde_json::json!({
+            "ok": true,
+            "rows_updated": rows,
+            "note": note,
+        })
+        .to_string(),
+        Err(e) => error_json(format!("Update failed: {e}")),
+    }
 }
 
 fn execute_readonly_sql(db_path: &str, query: &str, max_rows: Option<usize>) -> String {
