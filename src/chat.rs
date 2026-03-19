@@ -11,6 +11,9 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+/// Available chat models, cycled via `m` key in chat mode.
+const AVAILABLE_MODELS: &[&str] = &["gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4"];
+
 const DEFAULT_SQL_MAX_ROWS: usize = 500;
 const MAX_SQL_MAX_ROWS: usize = 5000;
 
@@ -36,6 +39,8 @@ pub enum ChatEvent {
         text: String,
         history: Vec<serde_json::Value>,
     },
+    /// Intermediate status shown while the model is working (tool calls, searches).
+    Status(String),
     Error(String),
 }
 
@@ -82,6 +87,21 @@ impl ChatState {
         self.api_key = key.filter(|k| !k.is_empty());
     }
 
+    /// Current model name for display.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Cycle to the next available model.
+    pub fn cycle_model(&mut self) {
+        let current_idx = AVAILABLE_MODELS
+            .iter()
+            .position(|&m| m == self.model)
+            .unwrap_or(0);
+        let next_idx = (current_idx + 1) % AVAILABLE_MODELS.len();
+        self.model = AVAILABLE_MODELS[next_idx].to_string();
+    }
+
     fn push_message(&mut self, role: ChatRole, text: String) {
         let rendered = match role {
             ChatRole::User => render_user_message(&text),
@@ -123,7 +143,8 @@ impl ChatState {
         let model = self.model.clone();
 
         tokio::spawn(async move {
-            let event = run_chat_turn(&api_key, &model, &db_path, &text, history).await;
+            let event =
+                run_chat_turn(&api_key, &model, &db_path, &text, history, &tx).await;
             let _ = tx.send(event);
         });
     }
@@ -136,6 +157,10 @@ impl ChatState {
                     self.push_message(ChatRole::Assistant, text);
                     self.waiting = false;
                     self.scroll_offset = 0;
+                }
+                ChatEvent::Status(msg) => {
+                    self.push_message(ChatRole::System, msg);
+                    // Still waiting — more events coming
                 }
                 ChatEvent::Error(err) => {
                     self.push_message(ChatRole::System, err);
@@ -324,7 +349,9 @@ Use these names when presenting service UUID data to the user.
 ## Instructions
 
 Use `run_sql` for database access. Use `code_interpreter` for multi-step analysis, anomaly scoring, or summarizing large SQL results. Use `web_search` only when external current facts are necessary.
-Prefer SQL aggregation over dumping raw rows. If you need CTEs, `WITH ... SELECT ...` queries are allowed. Format responses as markdown with tables for tabular data. Be concise and cite web sources when you use web search."#
+Prefer SQL aggregation over dumping raw rows. If you need CTEs, `WITH ... SELECT ...` queries are allowed.
+
+**Formatting**: Responses are rendered in a terminal. Keep markdown tables narrow — abbreviate column headers, truncate long values, and limit to ~5 columns so they fit in ~80 chars. Use bullet lists instead of tables when there are only 1-2 columns. Be concise and cite web sources when you use web search."#
     )
 }
 
@@ -371,6 +398,7 @@ async fn run_chat_turn(
     db_path: &str,
     user_text: &str,
     history: Vec<serde_json::Value>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> ChatEvent {
     let client = reqwest::Client::new();
     let tools = build_tools();
@@ -433,16 +461,48 @@ async fn run_chat_turn(
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    // Surface server-side tool usage (web_search, code_interpreter)
+                    if let Some(t) = item.r#type.as_deref() {
+                        let status = match t {
+                            "web_search_call" => Some("Searching the web...".to_string()),
+                            "code_interpreter_call" => Some("Running code analysis...".to_string()),
+                            _ => None,
+                        };
+                        if let Some(msg) = status {
+                            let _ = tx.send(ChatEvent::Status(msg));
+                        }
+                    }
+                }
             }
         }
 
         if !function_calls.is_empty() {
             context.extend(api_resp.output.iter().cloned());
 
-            for item in function_calls {
+            for item in &function_calls {
                 let call_id = item.call_id.as_deref().unwrap_or("");
                 let name = item.name.as_deref().unwrap_or("");
+
+                // Surface tool call status to the UI
+                let status = match name {
+                    "run_sql" => {
+                        let query = item
+                            .arguments
+                            .as_deref()
+                            .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                            .and_then(|v| v.get("query").and_then(|q| q.as_str()).map(String::from))
+                            .unwrap_or_default();
+                        let short = if query.len() > 80 {
+                            format!("{}...", &query[..77])
+                        } else {
+                            query
+                        };
+                        format!("Running SQL: {short}")
+                    }
+                    _ => format!("Using tool: {name}"),
+                };
+                let _ = tx.send(ChatEvent::Status(status));
 
                 if name == "run_sql" {
                     let args_str = item.arguments.as_deref().unwrap_or("{}");

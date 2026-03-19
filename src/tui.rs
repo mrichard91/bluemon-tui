@@ -62,7 +62,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_header(f, chunks[0], app);
         draw_chat_messages(f, chunks[1], app);
         draw_chat_input(f, chunks[2], app);
-        draw_chat_footer(f, chunks[3]);
+        draw_chat_footer(f, chunks[3], app);
     } else {
         let area = f.area();
         let chunks = Layout::vertical([
@@ -698,12 +698,22 @@ fn draw_chat_input(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_chat_footer(f: &mut Frame, area: Rect) {
-    f.render_widget(
-        Paragraph::new("Esc:Back  Enter:Send  Up/Down:Scroll")
-            .style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+fn draw_chat_footer(f: &mut Frame, area: Rect, app: &App) {
+    let model = app.chat.model();
+    let spans = vec![
+        Span::styled(
+            format!(" {model} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  Esc:Back  Enter:Send  m:Model  Up/Down:Scroll",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Abbreviate a MAC address to its first 4 octets: `AA:BB:CC:DD..`

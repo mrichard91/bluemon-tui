@@ -279,7 +279,11 @@ async fn run(
                             app.chat.input.pop();
                         }
                         KeyCode::Char(c) => {
-                            app.chat.input.push(c);
+                            if c == 'm' && app.chat.input.is_empty() && !app.chat.waiting {
+                                app.chat.cycle_model();
+                            } else {
+                                app.chat.input.push(c);
+                            }
                         }
                         KeyCode::Up => app.chat.scroll_up(),
                         KeyCode::Down => app.chat.scroll_down(),
