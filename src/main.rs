@@ -3,6 +3,7 @@
 mod app;
 mod chat;
 mod classifier;
+mod config;
 mod continuity;
 mod db;
 mod fast_pair;
@@ -37,17 +38,21 @@ use tokio::sync::mpsc;
 #[derive(Parser)]
 #[command(name = "bluemon-tui", about = "Interactive BLE scanner with TUI")]
 struct Cli {
-    /// BLE adapter index
-    #[arg(short, long, default_value_t = 0)]
-    adapter: usize,
+    /// BLE adapter index (overrides config file)
+    #[arg(short, long)]
+    adapter: Option<usize>,
 
-    /// Scan duration per cycle in seconds
-    #[arg(short, long, default_value_t = 3)]
-    scan_duration: u64,
+    /// Scan duration per cycle in seconds (overrides config file)
+    #[arg(short, long)]
+    scan_duration: Option<u64>,
 
     /// SQLite database path
     #[arg(long)]
     db: Option<PathBuf>,
+
+    /// Write template config files to ~/.config/bluemon-tui/ and exit
+    #[arg(long)]
+    init_config: bool,
 
     /// Write a template service_uuids.toml to ~/.config/bluemon-tui/ and exit
     #[arg(long)]
@@ -66,10 +71,17 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
 
+    if cli.init_config {
+        let dir = config::config_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("config.toml");
+        std::fs::write(&path, config::generate_template())?;
+        println!("Wrote config template to {}", path.display());
+        return Ok(());
+    }
+
     if cli.init_service_uuids {
-        let dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("bluemon-tui");
+        let dir = config::config_dir();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("service_uuids.toml");
         std::fs::write(&path, service_uuids::generate_template())?;
@@ -77,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let cfg = config::load();
     service_uuids::load_user_db();
 
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
@@ -92,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, cli, conn, db_path).await;
+    let result = run(&mut terminal, cli, cfg, conn, db_path).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -110,11 +123,13 @@ async fn main() -> anyhow::Result<()> {
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: Cli,
+    cfg: config::Config,
     conn: rusqlite::Connection,
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     let db_path_str = db_path.to_str().unwrap_or("bluemon.db").to_string();
-    let mut app = App::new(db_path_str);
+    app::init_path_loss_n(cfg.path_loss_n);
+    let mut app = App::new(db_path_str, &cfg);
 
     // Load persisted devices from DB and reclassify with latest classifier data
     match db::load_devices(&conn) {
@@ -146,12 +161,14 @@ async fn run(
     }
 
     // Create BLE adapter (shared between scanner and prober)
-    let adapter = scanner::get_adapter(cli.adapter).await?;
+    let adapter_index = cli.adapter.unwrap_or(cfg.adapter);
+    let adapter = scanner::get_adapter(adapter_index).await?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ScanMessage>();
 
     let scan_adapter = adapter.clone();
-    let scan_duration = Duration::from_secs(cli.scan_duration);
+    let scan_secs = cli.scan_duration.unwrap_or(cfg.scan_duration);
+    let scan_duration = Duration::from_secs(scan_secs);
     tokio::spawn(async move {
         scanner::scan_loop(tx, scan_adapter, scan_duration).await;
     });

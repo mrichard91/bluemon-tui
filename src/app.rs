@@ -5,6 +5,7 @@
 
 use crate::chat::ChatState;
 use crate::classifier::{self as cls, DeviceType};
+use crate::config::Config;
 use crate::continuity::ContinuityData;
 use crate::gatt::{self, GattDeviceInfo};
 use crate::scanner::ScanResult;
@@ -15,17 +16,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tokio::sync::mpsc;
 
-/// Path loss exponent for log-distance model. Higher = faster signal decay.
-/// - 2.0: free space (outdoors, line-of-sight)
-/// - 3.0: typical indoor (default)
-/// - 3.5–4.0: dense indoor (multiple walls/floors)
-/// Override via BLE_PATH_LOSS_N in .env.
+/// Path loss exponent for log-distance model. Loaded once from config/env.
+/// Set via `init_path_loss_n()` at startup, defaults to 3.0 (typical indoor).
 static PATH_LOSS_N: LazyLock<f64> = LazyLock::new(|| {
-    std::env::var("BLE_PATH_LOSS_N")
+    std::env::var("_BLUEMON_PATH_LOSS_N")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3.0)
 });
+
+/// Set the path loss exponent before any distance estimation occurs.
+/// Called once from main after loading config.
+pub fn init_path_loss_n(n: f64) {
+    std::env::set_var("_BLUEMON_PATH_LOSS_N", n.to_string());
+}
 
 /// Per-MAC device record from BLE scanning. Contains all raw data captured
 /// during scan; manufacturer_data is only populated at scan time (not persisted).
@@ -201,7 +205,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(db_path: String) -> Self {
+    pub fn new(db_path: String, cfg: &Config) -> Self {
         Self {
             devices: HashMap::new(),
             aggregated: HashMap::new(),
@@ -221,7 +225,7 @@ impl App {
             scanning: true,
             fingerprint_groups: HashMap::new(),
             chat_mode: false,
-            chat: ChatState::new(db_path),
+            chat: ChatState::new(db_path, cfg),
             probe_tx: None,
             detail_mode: false,
             detail_scroll: 0,
@@ -787,7 +791,7 @@ mod tests {
 
     #[test]
     fn upsert_new_device() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
         assert!(app.devices.contains_key("AA:BB:CC:DD:EE:FF"));
         assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].sightings, 1);
@@ -795,7 +799,7 @@ mod tests {
 
     #[test]
     fn upsert_preserves_first_seen() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
         let first_seen = app.devices["AA:BB:CC:DD:EE:FF"].first_seen;
 
@@ -807,7 +811,7 @@ mod tests {
 
     #[test]
     fn upsert_updates_name_when_some() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
         assert!(app.devices["AA:BB:CC:DD:EE:FF"].name.is_none());
 
@@ -819,7 +823,7 @@ mod tests {
 
     #[test]
     fn upsert_does_not_clear_name_with_none() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         let mut r = make_scan_result("AA:BB:CC:DD:EE:FF");
         r.name = Some("MyDevice".into());
         app.upsert_device(r);
@@ -831,7 +835,7 @@ mod tests {
 
     #[test]
     fn upsert_tracks_fingerprint_groups() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:01"));
         app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:02"));
         // Both devices share fingerprint "ABCD"
@@ -844,7 +848,7 @@ mod tests {
 
     #[test]
     fn rebuild_fingerprint_groups_from_devices() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         let now = Local::now();
         app.devices.insert("MAC1".into(), DeviceInfo {
             mac: "MAC1".into(), name: None, rssi: None, tx_power: None,
@@ -884,7 +888,7 @@ mod tests {
 
     #[test]
     fn save_note_attaches_to_device() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
 
         app.note_mode = true;
@@ -898,7 +902,7 @@ mod tests {
 
     #[test]
     fn save_empty_note_clears() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
         app.devices.get_mut("AA:BB:CC:DD:EE:FF").unwrap().note = Some("old".into());
 
@@ -939,7 +943,7 @@ mod tests {
 
     #[test]
     fn cancel_note_clears_state() {
-        let mut app = App::new(":memory:".into());
+        let mut app = App::new(":memory:".into(), &Config::default());
         app.note_mode = true;
         app.note_mac = "AA:BB:CC:DD:EE:FF".into();
         app.note_input = "test".into();

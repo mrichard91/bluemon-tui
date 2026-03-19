@@ -4,13 +4,13 @@
 //! Includes SQL tool execution, markdown rendering for TUI display, and
 //! conversation history management.
 
+use crate::config::Config;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-const DEFAULT_CHAT_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_SQL_MAX_ROWS: usize = 500;
 const MAX_SQL_MAX_ROWS: usize = 5000;
 
@@ -55,17 +55,12 @@ pub struct ChatState {
 }
 
 impl ChatState {
-    pub fn new(db_path: String) -> Self {
+    pub fn new(db_path: String, cfg: &Config) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let api_key = load_api_key_from_db(&db_path).or_else(|| {
-            std::env::var("OPENAI_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty())
-        });
-        let model = std::env::var("OPENAI_MODEL")
-            .ok()
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string());
+        // API key priority: DB (set via K key) → config file → env var
+        let api_key = load_api_key_from_db(&db_path)
+            .or_else(|| cfg.openai_api_key.clone());
+        let model = cfg.openai_model.clone();
         Self {
             messages: Vec::new(),
             input: String::new(),
