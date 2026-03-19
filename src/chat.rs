@@ -476,11 +476,20 @@ async fn run_chat_turn(
     let mut context = history;
     context.push(user_message_item(user_text));
     let mut iterations = 0;
-    const MAX_ITERATIONS: usize = 10;
+    const MAX_ITERATIONS: usize = 25;
+    let mut accumulated_text: Vec<String> = Vec::new();
 
     loop {
         iterations += 1;
         if iterations > MAX_ITERATIONS {
+            // Return whatever text we've accumulated rather than discarding it
+            if !accumulated_text.is_empty() {
+                let text = accumulated_text.join("");
+                return ChatEvent::AssistantMessage {
+                    text,
+                    history: context,
+                };
+            }
             return ChatEvent::Error("Too many tool-call iterations, stopping.".into());
         }
 
@@ -552,6 +561,11 @@ async fn run_chat_turn(
                     }
                 }
             }
+        }
+
+        // Accumulate any text emitted alongside tool calls
+        if !text_parts.is_empty() {
+            accumulated_text.extend(text_parts);
         }
 
         if !function_calls.is_empty() {
@@ -648,8 +662,8 @@ async fn run_chat_turn(
             continue;
         }
 
-        let full_text = text_parts.join("");
         context.extend(api_resp.output.iter().cloned());
+        let full_text = accumulated_text.join("");
         if !full_text.is_empty() {
             return ChatEvent::AssistantMessage {
                 text: full_text,
