@@ -34,6 +34,8 @@ pub struct ChatMessage {
     pub role: ChatRole,
     pub raw_text: String,
     pub rendered: Vec<Line<'static>>,
+    /// Optional ID for in-place updates (tool status messages).
+    pub status_id: Option<String>,
 }
 
 pub enum ChatEvent {
@@ -41,8 +43,8 @@ pub enum ChatEvent {
         text: String,
         history: Vec<serde_json::Value>,
     },
-    /// Intermediate status shown while the model is working (tool calls, searches).
-    Status(String),
+    /// Intermediate tool status. Messages with the same `id` update in place.
+    Status { id: String, text: String },
     Error(String),
 }
 
@@ -115,6 +117,7 @@ impl ChatState {
             role,
             raw_text: text,
             rendered,
+            status_id: None,
         });
     }
 
@@ -161,9 +164,25 @@ impl ChatState {
                     self.waiting = false;
                     self.scroll_offset = 0;
                 }
-                ChatEvent::Status(msg) => {
-                    self.push_message(ChatRole::ToolStatus, msg);
-                    // Still waiting — more events coming
+                ChatEvent::Status { id, text } => {
+                    let rendered = render_tool_status(&text);
+                    // Update existing message with same id, or add new one
+                    if let Some(existing) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.status_id.as_deref() == Some(&id))
+                    {
+                        existing.raw_text = text;
+                        existing.rendered = rendered;
+                    } else {
+                        self.messages.push(ChatMessage {
+                            role: ChatRole::ToolStatus,
+                            raw_text: text,
+                            rendered,
+                            status_id: Some(id),
+                        });
+                    }
                 }
                 ChatEvent::Error(err) => {
                     self.push_message(ChatRole::System, err);
@@ -467,13 +486,20 @@ async fn run_chat_turn(
                 _ => {
                     // Surface server-side tool usage (web_search, code_interpreter)
                     if let Some(t) = item.r#type.as_deref() {
-                        let status = match t {
-                            "web_search_call" => Some("\u{25D0} Searching the web..."),
-                            "code_interpreter_call" => Some("\u{25D0} Running code analysis..."),
-                            _ => None,
+                        let (id, msg) = match t {
+                            "web_search_call" => {
+                                (Some(t.to_string()), "\u{25D0} Searching the web...")
+                            }
+                            "code_interpreter_call" => {
+                                (Some(t.to_string()), "\u{25D0} Running code analysis...")
+                            }
+                            _ => (None, ""),
                         };
-                        if let Some(msg) = status {
-                            let _ = tx.send(ChatEvent::Status(msg.to_string()));
+                        if let Some(id) = id {
+                            let _ = tx.send(ChatEvent::Status {
+                                id,
+                                text: msg.to_string(),
+                            });
                         }
                     }
                 }
@@ -502,7 +528,11 @@ async fn run_chat_turn(
                         query_preview
                     };
 
-                    let _ = tx.send(ChatEvent::Status(format!("\u{25D0} SQL: {short}")));
+                    let status_id = call_id.to_string();
+                    let _ = tx.send(ChatEvent::Status {
+                        id: status_id.clone(),
+                        text: format!("\u{25D0} SQL: {short}"),
+                    });
 
                     let result = match parsed {
                         Ok(args) => {
@@ -519,13 +549,16 @@ async fn run_chat_turn(
                         Err(e) => format!("{{\"error\": \"Invalid arguments: {e}\"}}")
                     };
 
-                    // Parse row count from result for the completion message
+                    // Update the same status line with completion
                     let row_info = serde_json::from_str::<serde_json::Value>(&result)
                         .ok()
                         .and_then(|v| v.get("row_count").and_then(|n| n.as_u64()))
                         .map(|n| format!(" ({n} rows)"))
                         .unwrap_or_default();
-                    let _ = tx.send(ChatEvent::Status(format!("\u{2713} SQL{row_info}: {short}")));
+                    let _ = tx.send(ChatEvent::Status {
+                        id: status_id,
+                        text: format!("\u{2713} SQL{row_info}: {short}"),
+                    });
 
                     tool_outputs.push(serde_json::json!({
                         "type": "function_call_output",
@@ -533,9 +566,10 @@ async fn run_chat_turn(
                         "output": result,
                     }));
                 } else {
-                    let _ = tx.send(ChatEvent::Status(
-                        format!("\u{25D0} Using tool: {name}"),
-                    ));
+                    let _ = tx.send(ChatEvent::Status {
+                        id: call_id.to_string(),
+                        text: format!("\u{25D0} Using tool: {name}"),
+                    });
                 }
             }
 
