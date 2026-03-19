@@ -1,3 +1,5 @@
+//! CLI entry point and main event loop for the BLE scanner TUI.
+
 mod app;
 mod chat;
 mod classifier;
@@ -9,6 +11,11 @@ mod scanner;
 mod service_uuids;
 mod tui;
 mod vendor;
+
+/// Seconds before a GATT probe can be re-sent to the same device.
+const PROBE_COOLDOWN_SECS: i64 = 300;
+/// Seconds a status message stays visible in the footer.
+const STATUS_DISPLAY_SECS: i64 = 8;
 
 use app::App;
 use chrono::{Local, Timelike};
@@ -337,11 +344,7 @@ async fn run(
                         rssi: result.rssi,
                         name: result.name.clone(),
                         service_uuids: result.service_uuids.join(","),
-                        fingerprint: if result.fingerprint.is_empty() {
-                            result.mac.clone()
-                        } else {
-                            result.fingerprint.clone()
-                        },
+                        fingerprint: app::effective_key(&result.fingerprint, &result.mac),
                     });
                     app.upsert_device(result);
                 }
@@ -352,11 +355,7 @@ async fn run(
                         let hour = Local::now().hour() as usize;
                         let mut seen_fingerprints = HashSet::new();
                         for obs in pending_obs.values() {
-                            let key = if obs.fingerprint.is_empty() {
-                                obs.mac.clone()
-                            } else {
-                                obs.fingerprint.clone()
-                            };
+                            let key = app::effective_key(&obs.fingerprint, &obs.mac);
                             if seen_fingerprints.insert(key.clone()) {
                                 let entry = app.hourly_cache.entry(key).or_insert([0u32; 24]);
                                 entry[hour] += 1;
@@ -395,7 +394,7 @@ async fn run(
 
         // Clear probe status after 8 seconds
         if let Some((_, ts)) = &app.probe_status {
-            if Local::now().signed_duration_since(*ts).num_seconds() >= 8 {
+            if Local::now().signed_duration_since(*ts).num_seconds() >= STATUS_DISPLAY_SECS {
                 app.probe_status = None;
             }
         }
@@ -422,7 +421,7 @@ fn try_probe(app: &mut App) {
         .probe_cooldowns
         .get(&fp)
         .map_or(true, |last| {
-            now.signed_duration_since(*last).num_seconds() >= 300
+            now.signed_duration_since(*last).num_seconds() >= PROBE_COOLDOWN_SECS
         });
     if can_probe {
         app.probe_cooldowns.insert(fp, now);

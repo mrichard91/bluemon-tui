@@ -1,3 +1,9 @@
+//! AI chat integration using the OpenAI Responses API.
+//!
+//! Provides a conversational interface for querying the Bluetooth scan database.
+//! Includes SQL tool execution, markdown rendering for TUI display, and
+//! conversation history management.
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use rusqlite::{Connection, OpenFlags};
@@ -74,12 +80,21 @@ impl ChatState {
         }
     }
 
-    pub fn has_api_key(&self) -> bool {
-        self.api_key.as_ref().is_some_and(|k| !k.is_empty())
-    }
-
     pub fn set_api_key(&mut self, key: Option<String>) {
         self.api_key = key.filter(|k| !k.is_empty());
+    }
+
+    fn push_message(&mut self, role: ChatRole, text: String) {
+        let rendered = match role {
+            ChatRole::User => render_user_message(&text),
+            ChatRole::Assistant => render_assistant_message(&text),
+            ChatRole::System => render_system_message(&text),
+        };
+        self.messages.push(ChatMessage {
+            role,
+            raw_text: text,
+            rendered,
+        });
     }
 
     pub fn send_message(&mut self) {
@@ -90,23 +105,16 @@ impl ChatState {
         let api_key = match &self.api_key {
             Some(k) => k.clone(),
             None => {
-                self.messages.push(ChatMessage {
-                    role: ChatRole::System,
-                    raw_text: "Press K to set an OpenAI API key in the TUI.".into(),
-                    rendered: render_system_message(
-                        "Press K to set an OpenAI API key in the TUI.",
-                    ),
-                });
+                self.push_message(
+                    ChatRole::System,
+                    "Press K to set an OpenAI API key in the TUI.".into(),
+                );
                 return;
             }
         };
 
         let text = std::mem::take(&mut self.input);
-        self.messages.push(ChatMessage {
-            role: ChatRole::User,
-            raw_text: text.clone(),
-            rendered: render_user_message(&text),
-        });
+        self.push_message(ChatRole::User, text.clone());
 
         self.waiting = true;
         self.scroll_offset = 0;
@@ -127,20 +135,12 @@ impl ChatState {
             match event {
                 ChatEvent::AssistantMessage { text, history } => {
                     self.history = history;
-                    self.messages.push(ChatMessage {
-                        role: ChatRole::Assistant,
-                        raw_text: text.clone(),
-                        rendered: render_assistant_message(&text),
-                    });
+                    self.push_message(ChatRole::Assistant, text);
                     self.waiting = false;
                     self.scroll_offset = 0;
                 }
                 ChatEvent::Error(err) => {
-                    self.messages.push(ChatMessage {
-                        role: ChatRole::System,
-                        raw_text: err.clone(),
-                        rendered: render_system_message(&err),
-                    });
+                    self.push_message(ChatRole::System, err);
                     self.waiting = false;
                 }
             }
@@ -193,6 +193,7 @@ fn load_api_key_from_db(db_path: &str) -> Option<String> {
 
 #[derive(Deserialize)]
 struct ApiResponse {
+    #[allow(dead_code)]
     id: Option<String>,
     #[serde(default)]
     output: Vec<serde_json::Value>,
@@ -518,6 +519,10 @@ async fn create_response(
 
 // ── SQL executor ────────────────────────────────────────────────────────
 
+fn error_json(msg: impl std::fmt::Display) -> String {
+    serde_json::json!({ "error": msg.to_string() }).to_string()
+}
+
 fn execute_readonly_sql(db_path: &str, query: &str, max_rows: Option<usize>) -> String {
     let trimmed = query.trim();
 
@@ -528,10 +533,7 @@ fn execute_readonly_sql(db_path: &str, query: &str, max_rows: Option<usize>) -> 
         .to_ascii_uppercase();
     let is_allowed = matches!(first_word.as_str(), "SELECT" | "WITH");
     if !is_allowed || trimmed.contains(';') {
-        return serde_json::json!({
-            "error": "Only single SELECT queries or WITH...SELECT queries are allowed."
-        })
-        .to_string();
+        return error_json("Only single SELECT queries or WITH...SELECT queries are allowed.");
     }
 
     let max_rows = max_rows
@@ -542,14 +544,14 @@ fn execute_readonly_sql(db_path: &str, query: &str, max_rows: Option<usize>) -> 
     let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(c) => c,
         Err(e) => {
-            return serde_json::json!({ "error": format!("DB open error: {e}") }).to_string()
+            return error_json(format!("DB open error: {e}"))
         }
     };
 
     let mut stmt = match conn.prepare(trimmed) {
         Ok(s) => s,
         Err(e) => {
-            return serde_json::json!({ "error": format!("SQL error: {e}") }).to_string()
+            return error_json(format!("SQL error: {e}"))
         }
     };
 
@@ -593,15 +595,12 @@ fn execute_readonly_sql(db_path: &str, query: &str, max_rows: Option<usize>) -> 
                 }
                 match row_result {
                     Ok(val) => rows.push(val),
-                    Err(e) => {
-                        return serde_json::json!({ "error": format!("Row error: {e}") })
-                            .to_string()
-                    }
+                    Err(e) => return error_json(format!("Row error: {e}")),
                 }
             }
         }
         Err(e) => {
-            return serde_json::json!({ "error": format!("Query error: {e}") }).to_string()
+            return error_json(format!("Query error: {e}"))
         }
     }
 
@@ -665,32 +664,14 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Headers
-        if line.starts_with("### ") {
-            lines.push(Line::from(Span::styled(
-                line[4..].to_string(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            continue;
-        }
-        if line.starts_with("## ") {
-            lines.push(Line::from(Span::styled(
-                line[3..].to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            continue;
-        }
-        if line.starts_with("# ") {
-            lines.push(Line::from(Span::styled(
-                line[2..].to_string(),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )));
+        // Headers (check longest prefix first)
+        if let Some(heading) = line
+            .strip_prefix("### ")
+            .map(|t| render_heading(t, Color::Cyan))
+            .or_else(|| line.strip_prefix("## ").map(|t| render_heading(t, Color::Yellow)))
+            .or_else(|| line.strip_prefix("# ").map(|t| render_heading(t, Color::Magenta)))
+        {
+            lines.push(heading);
             continue;
         }
 
@@ -740,6 +721,13 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn render_heading(text: &str, color: Color) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
 }
 
 /// Parse inline markdown: **bold** and `code`.

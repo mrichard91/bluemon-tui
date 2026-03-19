@@ -297,30 +297,20 @@ impl ContinuityData {
 ///   [2]   battery: left (high nibble), right (low nibble); 0xF = unknown
 ///   [3]   case battery (high nibble, 0xF = unknown), charging flags (low nibble)
 ///   [4]   lid open (bit 0)
+/// Decode a 4-bit battery nibble (0–10 valid, >10 means unknown).
+fn decode_battery_nibble(nibble: u8) -> Option<u8> {
+    if nibble <= 10 { Some(nibble) } else { None }
+}
+
 fn parse_airpods(payload: &[u8], extended: bool) -> ContinuityData {
     let device_model = u16::from_be_bytes([payload[0], payload[1]]);
 
     let bat_byte = payload[2];
-    let raw_left = (bat_byte >> 4) & 0x0F;
-    let raw_right = bat_byte & 0x0F;
-    let battery_left = if raw_left <= 10 {
-        Some(raw_left)
-    } else {
-        None
-    };
-    let battery_right = if raw_right <= 10 {
-        Some(raw_right)
-    } else {
-        None
-    };
+    let battery_left = decode_battery_nibble((bat_byte >> 4) & 0x0F);
+    let battery_right = decode_battery_nibble(bat_byte & 0x0F);
 
     let case_charge = payload[3];
-    let raw_case = (case_charge >> 4) & 0x0F;
-    let battery_case = if raw_case <= 10 {
-        Some(raw_case)
-    } else {
-        None
-    };
+    let battery_case = decode_battery_nibble((case_charge >> 4) & 0x0F);
     let charge_flags = case_charge & 0x0F;
     let charging_left = (charge_flags & 0x04) != 0;
     let charging_right = (charge_flags & 0x02) != 0;

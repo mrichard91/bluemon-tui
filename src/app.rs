@@ -1,3 +1,8 @@
+//! App state, device aggregation, and distance estimation.
+//!
+//! This module owns the runtime device table, fingerprint grouping, sorting/filtering,
+//! and the aggregation logic that collapses multiple MACs into logical devices.
+
 use crate::chat::ChatState;
 use crate::classifier::{self as cls, DeviceType};
 use crate::continuity::ContinuityData;
@@ -22,6 +27,8 @@ static PATH_LOSS_N: LazyLock<f64> = LazyLock::new(|| {
         .unwrap_or(3.0)
 });
 
+/// Per-MAC device record from BLE scanning. Contains all raw data captured
+/// during scan; manufacturer_data is only populated at scan time (not persisted).
 #[derive(Clone)]
 pub struct DeviceInfo {
     pub mac: String,
@@ -36,15 +43,19 @@ pub struct DeviceInfo {
     pub last_seen: DateTime<Local>,
     pub is_randomized: bool,
     pub note: Option<String>,
+    /// 4-char hex hash grouping randomized MACs to the same physical device.
     pub fingerprint: String,
+    /// Only populated at scan time; empty after DB load.
     pub manufacturer_data: HashMap<u16, Vec<u8>>,
     pub continuity: Option<ContinuityData>,
     pub gatt_info: Option<GattDeviceInfo>,
     pub fast_pair_model: Option<String>,
+    /// Bluetooth Class of Device (24-bit field).
     pub device_class: Option<u32>,
     pub addr_type: Option<cls::BleAddrType>,
 }
 
+/// Logical device shown in the TUI table — one or more MACs grouped by fingerprint.
 #[derive(Clone)]
 pub struct AggregatedDevice {
     pub fingerprint: String,
@@ -121,6 +132,16 @@ impl SortColumn {
 /// - Default: -59 dBm (typical BLE received power at 1m).
 ///
 /// Formula: distance = 10 ^ ((ref_power - rssi) / (10 * n))
+/// Return the effective grouping key for a device: its fingerprint, or MAC as fallback
+/// for legacy DB rows with empty fingerprints.
+pub fn effective_key(fingerprint: &str, mac: &str) -> String {
+    if fingerprint.is_empty() {
+        mac.to_string()
+    } else {
+        fingerprint.to_string()
+    }
+}
+
 pub fn estimate_distance(rssi: i16, _tx_power: Option<i16>, ibeacon_power: Option<i8>) -> f64 {
     let ref_power = match ibeacon_power {
         Some(ibp) => ibp as f64,
@@ -310,13 +331,7 @@ impl App {
     pub fn rebuild_fingerprint_groups(&mut self) {
         self.fingerprint_groups.clear();
         for (mac, dev) in &self.devices {
-            // Legacy DB rows may have fingerprint = "" — use MAC as fallback
-            // so they don't all collapse into one group.
-            let fp = if dev.fingerprint.is_empty() {
-                mac.clone()
-            } else {
-                dev.fingerprint.clone()
-            };
+            let fp = effective_key(&dev.fingerprint, mac);
             self.fingerprint_groups
                 .entry(fp)
                 .or_default()
@@ -530,13 +545,10 @@ impl App {
         let note = std::mem::take(&mut self.note_input);
 
         let note_value = if note.is_empty() { None } else { Some(note) };
-        let group_key = self.devices.get(&mac).map(|d| {
-            if d.fingerprint.is_empty() {
-                mac.clone()
-            } else {
-                d.fingerprint.clone()
-            }
-        })?;
+        let group_key = self
+            .devices
+            .get(&mac)
+            .map(|d| effective_key(&d.fingerprint, &mac))?;
 
         if let Some(macs) = self.fingerprint_groups.get(&group_key).cloned() {
             for group_mac in macs {

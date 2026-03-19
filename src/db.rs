@@ -1,3 +1,8 @@
+//! SQLite persistence layer for device and observation data.
+//!
+//! Handles schema creation, migrations, reference data seeding from compiled-in CSVs,
+//! and all read/write operations. Uses WAL mode for concurrent scan writes and chat reads.
+
 use crate::app::DeviceInfo;
 use crate::classifier::{self, DeviceType};
 use crate::continuity::ContinuityData;
@@ -6,6 +11,7 @@ use chrono::{DateTime, Local};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 
+/// Open (or create) the database and run migrations.
 pub fn open(path: &str) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -46,61 +52,31 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
     )?;
 
     // Migrate older databases that lack newer columns
-    let has_tx_power: bool = conn
-        .prepare("SELECT tx_power FROM devices LIMIT 0")
-        .is_ok();
-    if !has_tx_power {
-        conn.execute_batch("ALTER TABLE devices ADD COLUMN tx_power INTEGER;")?;
-    }
-    let has_last_rssi: bool = conn
-        .prepare("SELECT last_rssi FROM devices LIMIT 0")
-        .is_ok();
-    if !has_last_rssi {
-        conn.execute_batch("ALTER TABLE devices ADD COLUMN last_rssi INTEGER;")?;
-    }
-
-    // Migrate older databases that lack the fingerprint column
-    let has_fingerprint: bool = conn
-        .prepare("SELECT fingerprint FROM devices LIMIT 0")
-        .is_ok();
-    if !has_fingerprint {
-        conn.execute_batch("ALTER TABLE devices ADD COLUMN fingerprint TEXT DEFAULT '';")?;
-    }
-
-    // Migrate older databases that lack enrichment columns
-    if conn
-        .prepare("SELECT continuity_json FROM devices LIMIT 0")
-        .is_err()
-    {
-        conn.execute_batch(
-            "ALTER TABLE devices ADD COLUMN continuity_json TEXT DEFAULT '';
-             ALTER TABLE devices ADD COLUMN gatt_info_json TEXT DEFAULT '';
-             ALTER TABLE devices ADD COLUMN fast_pair_model TEXT DEFAULT '';",
-        )?;
-    }
-
-    if conn
-        .prepare("SELECT device_class FROM devices LIMIT 0")
-        .is_err()
-    {
-        conn.execute_batch("ALTER TABLE devices ADD COLUMN device_class INTEGER;")?;
-    }
-    if conn
-        .prepare("SELECT addr_type FROM devices LIMIT 0")
-        .is_err()
-    {
-        conn.execute_batch("ALTER TABLE devices ADD COLUMN addr_type TEXT DEFAULT '';")?;
-    }
-    if conn
-        .prepare("SELECT fingerprint FROM observations LIMIT 0")
-        .is_err()
-    {
-        conn.execute_batch("ALTER TABLE observations ADD COLUMN fingerprint TEXT DEFAULT '';")?;
-    }
+    ensure_column(&conn, "devices", "tx_power", "ALTER TABLE devices ADD COLUMN tx_power INTEGER;")?;
+    ensure_column(&conn, "devices", "last_rssi", "ALTER TABLE devices ADD COLUMN last_rssi INTEGER;")?;
+    ensure_column(&conn, "devices", "fingerprint", "ALTER TABLE devices ADD COLUMN fingerprint TEXT DEFAULT '';")?;
+    ensure_column(&conn, "devices", "continuity_json",
+        "ALTER TABLE devices ADD COLUMN continuity_json TEXT DEFAULT '';
+         ALTER TABLE devices ADD COLUMN gatt_info_json TEXT DEFAULT '';
+         ALTER TABLE devices ADD COLUMN fast_pair_model TEXT DEFAULT '';")?;
+    ensure_column(&conn, "devices", "device_class", "ALTER TABLE devices ADD COLUMN device_class INTEGER;")?;
+    ensure_column(&conn, "devices", "addr_type", "ALTER TABLE devices ADD COLUMN addr_type TEXT DEFAULT '';")?;
+    ensure_column(&conn, "observations", "fingerprint", "ALTER TABLE observations ADD COLUMN fingerprint TEXT DEFAULT '';")?;
 
     seed_reference_data(&conn)?;
 
     Ok(conn)
+}
+
+/// Add a column to a table if it doesn't already exist.
+fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> anyhow::Result<()> {
+    if conn
+        .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
+        .is_err()
+    {
+        conn.execute_batch(ddl)?;
+    }
+    Ok(())
 }
 
 fn seed_reference_data(conn: &Connection) -> anyhow::Result<()> {
@@ -171,6 +147,22 @@ fn seed_reference_data(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Deserialize an optional JSON string into a typed value, returning None on empty/invalid.
+fn deserialize_json_field<T: serde::de::DeserializeOwned>(json_str: Option<String>) -> Option<T> {
+    json_str
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str::<T>(s).ok())
+}
+
+/// Serialize an optional value to a JSON string, returning "" if None.
+fn serialize_json_field<T: serde::Serialize>(value: Option<&T>) -> String {
+    value
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default()
+}
+
+/// Load all devices from the database into a HashMap keyed by MAC address.
 pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceInfo>> {
     let mut stmt = conn.prepare(
         "SELECT mac, name, vendor, device_type, is_randomized,
@@ -216,14 +208,8 @@ pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceI
             .map(|s| s.to_string())
             .collect();
         let note = note.filter(|n| !n.is_empty());
-        let continuity = continuity_json
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .and_then(|s| serde_json::from_str::<ContinuityData>(s).ok());
-        let gatt_info = gatt_info_json
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .and_then(|s| serde_json::from_str::<GattDeviceInfo>(s).ok());
+        let continuity = deserialize_json_field::<ContinuityData>(continuity_json);
+        let gatt_info = deserialize_json_field::<GattDeviceInfo>(gatt_info_json);
         let fast_pair_model = fast_pair_model.filter(|s| !s.is_empty());
         let addr_type = addr_type_str
             .as_deref()
@@ -263,9 +249,12 @@ pub fn load_devices(conn: &Connection) -> anyhow::Result<HashMap<String, DeviceI
 /// Observation data captured at scan time for batch writing.
 pub struct PendingObs {
     pub mac: String,
+    /// Signal strength in dBm (closer to 0 = stronger).
     pub rssi: Option<i16>,
     pub name: Option<String>,
+    /// Comma-separated list of advertised BLE service UUIDs.
     pub service_uuids: String,
+    /// 4-char hex hash identifying the physical device.
     pub fingerprint: String,
 }
 
@@ -326,16 +315,8 @@ pub fn write_cycle(
                 continue;
             }
             if let Some(d) = devices.get(&obs.mac) {
-                let continuity_json = d
-                    .continuity
-                    .as_ref()
-                    .and_then(|c| serde_json::to_string(c).ok())
-                    .unwrap_or_default();
-                let gatt_info_json = d
-                    .gatt_info
-                    .as_ref()
-                    .and_then(|g| serde_json::to_string(g).ok())
-                    .unwrap_or_default();
+                let continuity_json = serialize_json_field(d.continuity.as_ref());
+                let gatt_info_json = serialize_json_field(d.gatt_info.as_ref());
                 let fast_pair_model = d.fast_pair_model.as_deref().unwrap_or("");
 
                 dev_stmt.execute(params![
@@ -366,6 +347,7 @@ pub fn write_cycle(
     Ok(())
 }
 
+/// Persist GATT Device Information Service data for a specific MAC.
 pub fn update_gatt_info(
     conn: &Connection,
     mac: &str,
@@ -379,6 +361,7 @@ pub fn update_gatt_info(
     Ok(())
 }
 
+/// Update the note for all devices sharing a fingerprint (or a single MAC).
 pub fn update_note_group(
     conn: &Connection,
     fingerprint: Option<&str>,
@@ -399,21 +382,8 @@ pub fn update_note_group(
     Ok(())
 }
 
-pub fn load_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    let mut stmt = conn.prepare("SELECT value FROM app_settings WHERE key = ?1")?;
-    let mut rows = stmt.query(params![key])?;
-    if let Some(row) = rows.next()? {
-        let value: String = row.get(0)?;
-        if value.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(value))
-        }
-    } else {
-        Ok(None)
-    }
-}
 
+/// Upsert a key/value setting; passing None deletes the key.
 pub fn save_setting(conn: &Connection, key: &str, value: Option<&str>) -> anyhow::Result<()> {
     match value.filter(|v| !v.is_empty()) {
         Some(value) => {
@@ -487,9 +457,11 @@ pub fn hourly_activity(conn: &Connection, macs: &[String]) -> anyhow::Result<[u3
     Ok(counts)
 }
 
-/// MAC rotation stats for a fingerprinted device group.
+/// MAC address rotation statistics for a fingerprinted device group.
 pub struct MacRotationStats {
+    /// Total distinct MAC addresses in the group.
     pub total_macs: usize,
+    /// Average minutes between consecutive MAC rotation events (None if ≤1 MAC).
     pub avg_rotation_mins: Option<f64>,
 }
 

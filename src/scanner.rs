@@ -1,3 +1,8 @@
+//! BLE scanning via btleplug.
+//!
+//! Runs a continuous scan loop on a background task, sending `ScanResult` messages
+//! per device advertisement and `CycleComplete` at configurable intervals.
+
 use crate::classifier::{self, DeviceType};
 use crate::vendor;
 use btleplug::api::{AddressType, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
@@ -7,6 +12,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// Device scan result built from a BLE advertisement.
 #[allow(dead_code)]
 pub struct ScanResult {
     pub mac: String,
@@ -22,9 +28,13 @@ pub struct ScanResult {
     pub fingerprint: String,
 }
 
+/// Messages sent from the scanner task to the main event loop.
 pub enum ScanMessage {
+    /// A device was discovered or updated.
     Result(ScanResult),
+    /// A scan cycle completed; flush pending observations to DB.
     CycleComplete,
+    /// Transient scanner error (logged, not fatal).
     Error(String),
 }
 

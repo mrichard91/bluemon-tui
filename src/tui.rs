@@ -1,3 +1,7 @@
+//! Terminal UI rendering (ratatui).
+//!
+//! Draws the main device table, detail popup, chat view, and footer bar.
+
 use crate::app::{
     format_compact, format_distance, format_relative, format_uptime, AggregatedDevice, App,
     SortColumn,
@@ -10,6 +14,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
+/// Color-code RSSI signal strength.
+/// -50 or better: strong (green); -50 to -70: medium (yellow); below -70: weak (red).
 fn rssi_color(rssi: i16) -> Color {
     if rssi >= -50 {
         Color::Green
@@ -251,21 +257,22 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
+/// Yellow-on-black bold badge used for input mode indicators in the footer.
+fn mode_label(text: &str) -> Span<'static> {
+    Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     if app.api_key_mode {
-        let masked = if app.api_key_input.is_empty() {
-            String::new()
-        } else {
-            "*".repeat(app.api_key_input.len())
-        };
+        let masked = "*".repeat(app.api_key_input.len());
         let spans = vec![
-            Span::styled(
-                " OpenAI Key ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            mode_label(" OpenAI Key "),
             Span::raw(" "),
             Span::styled(masked, Style::default().fg(Color::White)),
             Span::styled("_", Style::default().fg(Color::Yellow)),
@@ -274,13 +281,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     } else if app.note_mode {
         let spans = vec![
-            Span::styled(
-                " Note ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            mode_label(" Note "),
             Span::raw(format!(" {}: ", app.note_mac)),
             Span::styled(&app.note_input, Style::default().fg(Color::White)),
             Span::styled("_", Style::default().fg(Color::Yellow)),
@@ -324,6 +325,15 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     .split(v[1])[1]
 }
 
+/// Build a label: value line for the detail popup.
+fn detail_line(label: &str, value: impl Into<String>, value_style: Style) -> Line<'static> {
+    let ls = Style::default().fg(Color::Cyan);
+    Line::from(vec![
+        Span::styled(label.to_string(), ls),
+        Span::styled(value.into(), value_style),
+    ])
+}
+
 fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     let popup_area = centered_rect(70, 80, area);
     f.render_widget(Clear, popup_area);
@@ -340,8 +350,8 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     };
     let dev = app.devices.get(&agg.representative_mac);
 
-    let label_style = Style::default().fg(Color::Cyan);
-    let value_style = Style::default().fg(Color::White);
+    let ls = Style::default().fg(Color::Cyan);
+    let vs = Style::default().fg(Color::White);
     let section_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -354,56 +364,24 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     } else {
         agg.representative_mac.clone()
     };
-    lines.push(Line::from(vec![
-        Span::styled("MAC:         ", label_style),
-        Span::styled(mac_display, value_style),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Name:        ", label_style),
-        Span::styled(
-            agg.name.as_deref().unwrap_or("(none)").to_string(),
-            value_style,
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Vendor:      ", label_style),
-        Span::styled(
-            agg.vendor.as_deref().unwrap_or("(unknown)").to_string(),
-            value_style,
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Type:        ", label_style),
-        Span::styled(
-            format!("{} {}", agg.device_type.icon(), agg.device_type.label()),
-            Style::default().fg(agg.device_type.color()),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Fingerprint: ", label_style),
-        Span::styled(agg.fingerprint.clone(), value_style),
-    ]));
+    lines.push(detail_line("MAC:         ", mac_display, vs));
+    lines.push(detail_line("Name:        ", agg.name.as_deref().unwrap_or("(none)"), vs));
+    lines.push(detail_line("Vendor:      ", agg.vendor.as_deref().unwrap_or("(unknown)"), vs));
+    lines.push(detail_line(
+        "Type:        ",
+        format!("{} {}", agg.device_type.icon(), agg.device_type.label()),
+        Style::default().fg(agg.device_type.color()),
+    ));
+    lines.push(detail_line("Fingerprint: ", agg.fingerprint.clone(), vs));
     let rssi_str = agg
         .rssi
         .map(|r| format!("{r} dBm"))
         .unwrap_or_else(|| "(none)".to_string());
     let dist_str = format_distance(agg.rssi, agg.tx_power, agg.ibeacon_measured_power);
-    lines.push(Line::from(vec![
-        Span::styled("RSSI:        ", label_style),
-        Span::styled(format!("{rssi_str}  (Dist: {dist_str})"), value_style),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("First Seen:  ", label_style),
-        Span::styled(format_compact(agg.first_seen), value_style),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Last Seen:   ", label_style),
-        Span::styled(format_relative(agg.last_seen), value_style),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Sightings:   ", label_style),
-        Span::styled(agg.sightings.to_string(), value_style),
-    ]));
+    lines.push(detail_line("RSSI:        ", format!("{rssi_str}  (Dist: {dist_str})"), vs));
+    lines.push(detail_line("First Seen:  ", format_compact(agg.first_seen), vs));
+    lines.push(detail_line("Last Seen:   ", format_relative(agg.last_seen), vs));
+    lines.push(detail_line("Sightings:   ", agg.sightings.to_string(), vs));
     if let Some(addr_type) = agg.addr_type {
         let (label, color) = match addr_type {
             crate::classifier::BleAddrType::Public => ("Public (OUI-assigned)", Color::Green),
@@ -412,16 +390,10 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             crate::classifier::BleAddrType::NonResolvablePrivate => ("Non-Resolvable Private", Color::Red),
             crate::classifier::BleAddrType::Multicast => ("Multicast (anomalous)", Color::Red),
         };
-        lines.push(Line::from(vec![
-            Span::styled("Addr Type:   ", label_style),
-            Span::styled(label, Style::default().fg(color)),
-        ]));
+        lines.push(detail_line("Addr Type:   ", label, Style::default().fg(color)));
     }
     if let Some(note) = &agg.note {
-        lines.push(Line::from(vec![
-            Span::styled("Note:        ", label_style),
-            Span::styled(note.clone(), value_style),
-        ]));
+        lines.push(detail_line("Note:        ", note.clone(), vs));
     }
 
     // Continuity / iBeacon section
@@ -433,22 +405,10 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         } else {
             uuid.clone()
         };
-        lines.push(Line::from(vec![
-            Span::styled("  UUID:      ", label_style),
-            Span::styled(uuid_label, value_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Major:     ", label_style),
-            Span::styled(major.to_string(), value_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Minor:     ", label_style),
-            Span::styled(minor.to_string(), value_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Measured:  ", label_style),
-            Span::styled(format!("{measured_power} dBm"), value_style),
-        ]));
+        lines.push(detail_line("  UUID:      ", uuid_label, vs));
+        lines.push(detail_line("  Major:     ", major.to_string(), vs));
+        lines.push(detail_line("  Minor:     ", minor.to_string(), vs));
+        lines.push(detail_line("  Measured:  ", format!("{measured_power} dBm"), vs));
     } else if let Some(summary) = &agg.continuity_summary {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -468,65 +428,28 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             "-- GATT Device Info --",
             section_style,
         )));
-        if let Some(v) = &gatt.manufacturer_name {
-            lines.push(Line::from(vec![
-                Span::styled("  Manufacturer: ", label_style),
-                Span::styled(v.clone(), value_style),
-            ]));
+        let gatt_fields: &[(&str, Option<String>)] = &[
+            ("  Manufacturer: ", gatt.manufacturer_name.clone()),
+            ("  Model:        ", gatt.model_number.clone()),
+            ("  Firmware:     ", gatt.firmware_revision.clone()),
+            ("  Hardware:     ", gatt.hardware_revision.clone()),
+            ("  Software:     ", gatt.software_revision.clone()),
+            ("  PnP ID:       ", gatt.pnp_id.clone()),
+            ("  Battery:      ", gatt.battery_level.map(|v| format!("{v}%"))),
+        ];
+        for (label, value) in gatt_fields {
+            if let Some(v) = value {
+                lines.push(detail_line(label, v.clone(), vs));
+            }
         }
-        if let Some(v) = &gatt.model_number {
-            lines.push(Line::from(vec![
-                Span::styled("  Model:        ", label_style),
-                Span::styled(v.clone(), value_style),
-            ]));
-        }
-        if let Some(v) = &gatt.firmware_revision {
-            lines.push(Line::from(vec![
-                Span::styled("  Firmware:     ", label_style),
-                Span::styled(v.clone(), value_style),
-            ]));
-        }
-        if let Some(v) = &gatt.hardware_revision {
-            lines.push(Line::from(vec![
-                Span::styled("  Hardware:     ", label_style),
-                Span::styled(v.clone(), value_style),
-            ]));
-        }
-        if let Some(v) = &gatt.software_revision {
-            lines.push(Line::from(vec![
-                Span::styled("  Software:     ", label_style),
-                Span::styled(v.clone(), value_style),
-            ]));
-        }
-        if let Some(v) = &gatt.pnp_id {
-            lines.push(Line::from(vec![
-                Span::styled("  PnP ID:       ", label_style),
-                Span::styled(v.clone(), value_style),
-            ]));
-        }
-        if let Some(v) = &gatt.battery_level {
-            lines.push(Line::from(vec![
-                Span::styled("  Battery:      ", label_style),
-                Span::styled(format!("{v}%"), value_style),
-            ]));
-        }
-        lines.push(Line::from(vec![
-            Span::styled("  Probed at:    ", label_style),
-            Span::styled(gatt.probed_at.clone(), Style::default().fg(Color::DarkGray)),
-        ]));
+        lines.push(detail_line("  Probed at:    ", gatt.probed_at.clone(), Style::default().fg(Color::DarkGray)));
     }
 
     // Fast Pair section
     if let Some(model) = &agg.fast_pair_model {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "-- Fast Pair --",
-            section_style,
-        )));
-        lines.push(Line::from(vec![
-            Span::styled("  Model: ", label_style),
-            Span::styled(model.clone(), value_style),
-        ]));
+        lines.push(Line::from(Span::styled("-- Fast Pair --", section_style)));
+        lines.push(detail_line("  Model: ", model.clone(), vs));
     }
 
     // Manufacturer data hex dump
@@ -547,7 +470,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
                         .collect::<Vec<_>>()
                         .join(" ");
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {:04X}: ", id), label_style),
+                        Span::styled(format!("  {:04X}: ", id), ls),
                         Span::styled(hex, Style::default().fg(Color::DarkGray)),
                     ]));
                 }
@@ -594,10 +517,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             _ => "Other",
         };
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Device Class:", label_style),
-            Span::styled(format!(" {major_str} ({major}/{minor}) [0x{dc:06X}]"), value_style),
-        ]));
+        lines.push(detail_line("Device Class: ", format!("{major_str} ({major}/{minor}) [0x{dc:06X}]"), vs));
     }
 
     // RSSI sparkline
@@ -621,7 +541,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             }
         }).collect();
         lines.push(Line::from(vec![
-            Span::styled("  ", label_style),
+            Span::styled("  ", ls),
             Span::styled(sparkline, Style::default().fg(Color::Green)),
         ]));
         let last = app.detail_rssi_history.last().unwrap();
@@ -651,7 +571,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             }
         }).collect();
         lines.push(Line::from(vec![
-            Span::styled("  ", label_style),
+            Span::styled("  ", ls),
             Span::styled(heatmap, Style::default().fg(Color::Magenta)),
         ]));
         lines.push(Line::from(vec![
@@ -670,20 +590,14 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
                 "-- MAC Rotation --",
                 section_style,
             )));
-            lines.push(Line::from(vec![
-                Span::styled("  Total MACs: ", label_style),
-                Span::styled(rot.total_macs.to_string(), value_style),
-            ]));
+            lines.push(detail_line("  Total MACs: ", rot.total_macs.to_string(), vs));
             if let Some(avg) = rot.avg_rotation_mins {
                 let avg_str = if avg < 60.0 {
                     format!("{:.0} min", avg)
                 } else {
                     format!("{:.1} hrs", avg / 60.0)
                 };
-                lines.push(Line::from(vec![
-                    Span::styled("  Avg interval: ", label_style),
-                    Span::styled(avg_str, value_style),
-                ]));
+                lines.push(detail_line("  Avg interval: ", avg_str, vs));
             }
         }
     }

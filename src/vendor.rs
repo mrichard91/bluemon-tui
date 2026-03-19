@@ -1,3 +1,5 @@
+//! MAC OUI vendor lookup using the IEEE database (via `mac_oui` crate).
+
 use mac_oui::Oui;
 use std::sync::OnceLock;
 

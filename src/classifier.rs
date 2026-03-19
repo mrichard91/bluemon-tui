@@ -1,7 +1,14 @@
+//! Device type classification and fingerprinting.
+//!
+//! Classifies BLE devices using a 5-level priority system:
+//! Service UUIDs > Manufacturer data > Name patterns > Device class > Vendor patterns.
+//! Also computes stable fingerprints for correlating randomized MAC addresses.
+
 use ratatui::style::Color;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+/// Broad device category inferred from BLE advertisement data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceType {
     Phone,

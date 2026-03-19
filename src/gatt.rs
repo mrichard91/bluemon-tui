@@ -1,3 +1,9 @@
+//! GATT Device Information Service prober.
+//!
+//! Connects to a BLE device and reads characteristics from the Device Information
+//! Service (0x180A) and Battery Service (0x180F). Runs as a long-lived background
+//! task receiving probe requests via channel.
+
 use btleplug::api::{Central, Peripheral as _};
 use btleplug::platform::Adapter;
 use chrono::Local;
@@ -21,10 +27,12 @@ pub struct GattDeviceInfo {
     pub probed_at: String,
 }
 
+/// Request to probe a specific device by MAC address.
 pub enum ProbeRequest {
     Probe { mac: String },
 }
 
+/// Result of a GATT probe attempt.
 pub enum ProbeResult {
     Success { mac: String, info: GattDeviceInfo },
     #[allow(dead_code)]
