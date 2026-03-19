@@ -335,9 +335,13 @@ CREATE TABLE observations (
     fingerprint TEXT DEFAULT ''     -- fingerprint at observation time
 );
 
-Indexes: idx_obs_mac(mac), idx_obs_seen(seen_at)
+Indexes: idx_obs_mac(mac), idx_obs_seen(seen_at), idx_obs_fp(fingerprint)
 
 device_type values: phone, tablet, laptop, computer, watch, audio, speaker, tv, vehicle, smart, wearable, gaming, camera, printer, network, unknown
+
+### Key columns not in CREATE (added by migration)
+- devices.last_rssi INTEGER — most recent RSSI reading
+- devices.device_class INTEGER — Bluetooth Class of Device (24-bit CoD)
 
 ## Enrichment Columns
 
@@ -369,6 +373,16 @@ Time-range filters:
 - time(seen_at) BETWEEN '09:00' AND '17:00' — business hours
 - date(first_seen) = date('now', 'localtime') — first seen today
 
+## Fingerprints vs MACs
+
+Many devices randomize their MAC address. The `fingerprint` column (4-char hex) groups
+rotating MACs that belong to the same physical device. When counting "devices" or
+"unique devices", always use `COUNT(DISTINCT fingerprint)` or group by fingerprint —
+NOT by MAC. A single physical device may have dozens of MACs.
+
+To get one row per physical device: `GROUP BY COALESCE(NULLIF(fingerprint, ''), mac)`.
+For devices with no fingerprint, fall back to MAC.
+
 ## Observations Table
 
 The observations table records every individual sighting of a device per scan cycle.
@@ -391,10 +405,52 @@ d0611e78=Apple Continuity, 7905f431=Apple ANCS, 89d3502b=Apple Media Service, 00
 
 Use these names when presenting service UUID data to the user.
 
+## Example Queries
+
+Count unique physical devices seen today:
+```sql
+SELECT COUNT(DISTINCT COALESCE(NULLIF(fingerprint, ''), mac)) FROM devices
+WHERE date(last_seen, 'localtime') = date('now', 'localtime')
+```
+
+Top device types currently nearby (seen in last 5 min):
+```sql
+SELECT device_type, COUNT(DISTINCT COALESCE(NULLIF(fingerprint, ''), mac)) AS cnt
+FROM devices WHERE last_seen >= datetime('now', 'localtime', '-5 minutes')
+GROUP BY device_type ORDER BY cnt DESC
+```
+
+Device visit pattern (when does a device appear each day):
+```sql
+SELECT date(seen_at, 'localtime') AS day,
+       MIN(time(seen_at, 'localtime')) AS first_seen,
+       MAX(time(seen_at, 'localtime')) AS last_seen,
+       COUNT(*) AS sightings
+FROM observations WHERE fingerprint = 'XXXX'
+GROUP BY day ORDER BY day DESC LIMIT 14
+```
+
+Signal strength trend for a device:
+```sql
+SELECT seen_at, rssi FROM observations
+WHERE fingerprint = 'XXXX' AND rssi IS NOT NULL
+ORDER BY seen_at DESC LIMIT 50
+```
+
+Apple devices with battery info:
+```sql
+SELECT name, fingerprint,
+       json_extract(continuity_json, '$.type') AS ctype,
+       json_extract(continuity_json, '$.battery_left') * 10 AS batt_l,
+       json_extract(continuity_json, '$.battery_right') * 10 AS batt_r
+FROM devices WHERE continuity_json != '' AND json_extract(continuity_json, '$.type') IN ('AirPods', 'AirPodsExtended')
+```
+
 ## Instructions
 
 Use `run_sql` for database access. Use `set_note` to add or update notes on devices (by MAC or fingerprint). Use `code_interpreter` for multi-step analysis, anomaly scoring, or summarizing large SQL results. Use `web_search` only when external current facts are necessary.
-Prefer SQL aggregation over dumping raw rows. If you need CTEs, `WITH ... SELECT ...` queries are allowed.
+
+**Efficiency**: Plan your query using the schema above before calling run_sql. Prefer a single well-crafted query over multiple exploratory ones. Use SQL aggregation (GROUP BY, COUNT, AVG) instead of fetching raw rows. CTEs with `WITH ... SELECT ...` are allowed.
 
 **Formatting**: Responses are rendered in a terminal. Keep markdown tables narrow — abbreviate column headers, truncate long values, and limit to ~5 columns so they fit in ~80 chars. Use bullet lists instead of tables when there are only 1-2 columns. Be concise and cite web sources when you use web search."#
     )
