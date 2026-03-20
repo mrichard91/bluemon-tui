@@ -3,3 +3,4 @@ target/
 *.sqlite*
 .env
 CLAUDE.md
+.claude/

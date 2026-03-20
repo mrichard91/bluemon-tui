@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze Bluemon DB"
+  short_description: "Query and interpret Bluemon scan data"
+  default_prompt: "Use $analyze-bluemon-db to investigate a question about the Bluetooth scan database."

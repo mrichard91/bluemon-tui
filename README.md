@@ -95,6 +95,10 @@ You can add rows to these CSVs and rebuild to extend the lookup tables.
 - `scripts/probe-gatt.py` - Standalone Python script to probe a device's GATT services (requires [bleak](https://github.com/hbldh/bleak))
 - `scripts/query-db.py` - Read-only SQL query tool for the scan database
 
+## Local Skills
+
+Repository-specific agent skills live in `.skills/`. The Bluetooth database analysis workflow is packaged as `.skills/analyze-bluemon-db/` rather than `.claude/commands/`.
+
 ## Inspired By
 
 This project was inspired by [bluehood](https://github.com/mrichard91/bluehood), a Bluetooth monitoring daemon with a web UI.
