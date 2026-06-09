@@ -47,7 +47,10 @@ pub enum ChatEvent {
         history: Vec<serde_json::Value>,
     },
     /// Intermediate tool status. Messages with the same `id` update in place.
-    Status { id: String, text: String },
+    Status {
+        id: String,
+        text: String,
+    },
     Error(String),
 }
 
@@ -172,8 +175,7 @@ impl ChatState {
 
         tokio::spawn(async move {
             let event =
-                run_chat_turn(&api_key, &model, &reasoning, &db_path, &text, history, &tx)
-                    .await;
+                run_chat_turn(&api_key, &model, &reasoning, &db_path, &text, history, &tx).await;
             let _ = tx.send(event);
         });
     }
@@ -320,9 +322,10 @@ CREATE TABLE devices (
     sightings INTEGER NOT NULL DEFAULT 0,
     tx_power INTEGER,
     fingerprint TEXT DEFAULT '',    -- 4-char hex, groups randomized MACs belonging to the same physical device
-    continuity_json TEXT DEFAULT '', -- JSON: Apple Continuity parsed data (type, battery levels, etc.)
-    gatt_info_json TEXT DEFAULT '',  -- JSON: GATT Device Information Service (manufacturer, model, firmware)
-    fast_pair_model TEXT DEFAULT ''  -- Google Fast Pair resolved device name (e.g. "Pixel Buds Pro")
+    continuity_json TEXT DEFAULT '', -- JSON ARRAY of Apple Continuity TLVs (multiple per ad: NearbyInfo + AirPlay etc.)
+    gatt_info_json TEXT DEFAULT '',  -- JSON: GATT Device Information Service (manufacturer, model, firmware, appearance, PnP)
+    fast_pair_model TEXT DEFAULT '',  -- Google Fast Pair resolved device name (e.g. "Pixel Buds Pro")
+    service_data_json TEXT DEFAULT '' -- JSON object: BLE service-data UUID -> hex payload (Eddystone, SwitchBot, Tile, etc.)
 );
 
 CREATE TABLE observations (
@@ -345,13 +348,16 @@ device_type values: phone, tablet, laptop, computer, watch, audio, speaker, tv, 
 
 ## Enrichment Columns
 
-- continuity_json: JSON object with Apple Continuity protocol data. Has a "type" field (IBeacon, AirDrop, HomeKit, AirPods, AirPlay, Handoff, NearbyInfo, NearbyAction, AirPodsExtended, FindMy, Unknown). Use json_extract() to query fields, e.g.:
-  - json_extract(continuity_json, '$.type') — continuity message type
-  - json_extract(continuity_json, '$.battery_left') — AirPods left battery (0-10, multiply by 10 for %)
-  - json_extract(continuity_json, '$.device_model') — AirPods model ID
-- gatt_info_json: JSON object with GATT Device Information Service data. Fields: manufacturer_name, model_number, firmware_revision, hardware_revision, software_revision, probed_at. E.g.:
+- continuity_json: JSON ARRAY of Apple Continuity TLVs. A single advertisement can carry several entries. Each has a "type" field. Possible types: IBeacon, ModemNote, Watch, AirDrop, HomeKit, AirPods, HeySiri, AirPlay, TetheringTarget, TetheringSource, Handoff, ProximityPairing, NearbyInfo, NearbyAction, AirPodsExtended, OfflineFinding, FindMy, Unknown. Index into the array with $[0], $[1], etc., or use json_each:
+  - json_extract(continuity_json, '$[0].type') — first TLV's type
+  - SELECT j.value->>'type', j.value->>'battery_left' FROM devices, json_each(continuity_json) j WHERE continuity_json != '' AND j.value->>'type' IN ('AirPods','AirPodsExtended')
+  - For AirPods battery: nibble values 0-10 represent 0%-100%; multiply by 10 for percent
+- gatt_info_json: JSON object with GATT Device Information Service data. Fields: manufacturer_name, model_number, firmware_revision, hardware_revision, software_revision, battery_level, pnp_id, pnp_vendor_id_source (1=BT,2=USB), pnp_vendor_id, pnp_product_id, pnp_product_version, appearance (16-bit GATT category), appearance_name, probed_at. E.g.:
   - json_extract(gatt_info_json, '$.manufacturer_name')
-  - json_extract(gatt_info_json, '$.model_number')
+  - json_extract(gatt_info_json, '$.appearance_name')
+  - json_extract(gatt_info_json, '$.pnp_vendor_id') — BT/USB VID for cross-referencing
+- service_data_json: JSON object mapping BLE service UUID (lowercase, full form) to hex-encoded payload bytes. Eddystone (0xFEAA), SwitchBot (cba20d00...), Tile (0xFEED/0xFEEC), Mi Band (0xFEE0), Microsoft Swift Pair (0xFD6E) and many other beacon protocols ride here, NOT in manufacturer_data. E.g.:
+  - json_extract(service_data_json, '$."0000feaa-0000-1000-8000-00805f9b34fb"') — Eddystone payload hex
 - fast_pair_model: Plain text device name from Google Fast Pair (e.g. "Pixel Buds Pro", "Galaxy Buds2 Pro")
 
 ## Timestamps
@@ -437,13 +443,22 @@ WHERE fingerprint = 'XXXX' AND rssi IS NOT NULL
 ORDER BY seen_at DESC LIMIT 50
 ```
 
-Apple devices with battery info:
+Apple devices with battery info (continuity_json is an array of TLVs):
 ```sql
-SELECT name, fingerprint,
-       json_extract(continuity_json, '$.type') AS ctype,
-       json_extract(continuity_json, '$.battery_left') * 10 AS batt_l,
-       json_extract(continuity_json, '$.battery_right') * 10 AS batt_r
-FROM devices WHERE continuity_json != '' AND json_extract(continuity_json, '$.type') IN ('AirPods', 'AirPodsExtended')
+SELECT d.name, d.fingerprint,
+       j.value->>'type' AS ctype,
+       (j.value->>'battery_left') * 10 AS batt_l,
+       (j.value->>'battery_right') * 10 AS batt_r
+FROM devices d, json_each(d.continuity_json) j
+WHERE d.continuity_json != ''
+  AND j.value->>'type' IN ('AirPods', 'AirPodsExtended')
+```
+
+Beacons broadcasting Eddystone telemetry (battery, uptime):
+```sql
+SELECT mac, name, vendor, service_data_json
+FROM devices
+WHERE service_data_json LIKE '%feaa%' AND service_data_json != ''
 ```
 
 ## Instructions
@@ -654,17 +669,14 @@ async fn run_chat_turn(
 
                     let result = match parsed {
                         Ok(args) => {
-                            let query = args
-                                .get("query")
-                                .and_then(|q| q.as_str())
-                                .unwrap_or("");
+                            let query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
                             let max_rows = args
                                 .get("max_rows")
                                 .and_then(|v| v.as_u64())
                                 .map(|v| v as usize);
                             execute_readonly_sql(db_path, query, max_rows)
                         }
-                        Err(e) => format!("{{\"error\": \"Invalid arguments: {e}\"}}")
+                        Err(e) => format!("{{\"error\": \"Invalid arguments: {e}\"}}"),
                     };
 
                     // Update the same status line with completion
@@ -767,10 +779,7 @@ fn error_json(msg: impl std::fmt::Display) -> String {
 }
 
 fn execute_set_note(db_path: &str, args: &serde_json::Value) -> String {
-    let note = args
-        .get("note")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
     let fingerprint = args.get("fingerprint").and_then(|v| v.as_str());
     let mac = args.get("mac").and_then(|v| v.as_str());
 
@@ -828,16 +837,12 @@ fn execute_readonly_sql(db_path: &str, query: &str, max_rows: Option<usize>) -> 
 
     let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(c) => c,
-        Err(e) => {
-            return error_json(format!("DB open error: {e}"))
-        }
+        Err(e) => return error_json(format!("DB open error: {e}")),
     };
 
     let mut stmt = match conn.prepare(trimmed) {
         Ok(s) => s,
-        Err(e) => {
-            return error_json(format!("SQL error: {e}"))
-        }
+        Err(e) => return error_json(format!("SQL error: {e}")),
     };
 
     let col_count = stmt.column_count();
@@ -884,9 +889,7 @@ fn execute_readonly_sql(db_path: &str, query: &str, max_rows: Option<usize>) -> 
                 }
             }
         }
-        Err(e) => {
-            return error_json(format!("Query error: {e}"))
-        }
+        Err(e) => return error_json(format!("Query error: {e}")),
     }
 
     serde_json::json!({
@@ -967,8 +970,14 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
         if let Some(heading) = line
             .strip_prefix("### ")
             .map(|t| render_heading(t, Color::Cyan))
-            .or_else(|| line.strip_prefix("## ").map(|t| render_heading(t, Color::Yellow)))
-            .or_else(|| line.strip_prefix("# ").map(|t| render_heading(t, Color::Magenta)))
+            .or_else(|| {
+                line.strip_prefix("## ")
+                    .map(|t| render_heading(t, Color::Yellow))
+            })
+            .or_else(|| {
+                line.strip_prefix("# ")
+                    .map(|t| render_heading(t, Color::Magenta))
+            })
         {
             lines.push(heading);
             continue;
@@ -1002,10 +1011,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
         // Bullet lists
         if line.starts_with("- ") || line.starts_with("* ") {
             let content = &line[2..];
-            let mut spans = vec![Span::styled(
-                "  • ",
-                Style::default().fg(Color::Cyan),
-            )];
+            let mut spans = vec![Span::styled("  • ", Style::default().fg(Color::Cyan))];
             spans.extend(parse_inline(content));
             lines.push(Line::from(spans));
             continue;

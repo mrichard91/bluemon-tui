@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// Parsed Apple Continuity protocol data from manufacturer data (company 0x004C).
+/// Parsed Apple Continuity protocol entry from manufacturer data (company 0x004C).
 ///
-/// The Continuity protocol uses Type-Length-Value encoding. We parse the first
-/// TLV entry and extract structured fields for each known message type.
+/// A single advertisement can contain multiple TLV entries (e.g. NearbyInfo +
+/// AirPlay simultaneously); use [`ContinuityData::parse_all`] to get every entry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContinuityData {
@@ -12,6 +12,14 @@ pub enum ContinuityData {
         major: u16,
         minor: u16,
         measured_power: i8,
+    },
+    /// Type 0x03 — Modem Note (presence only).
+    ModemNote {
+        flags: u8,
+    },
+    /// Type 0x04 — Paired Apple Watch presence.
+    Watch {
+        flags: u8,
     },
     AirDrop {
         contact_hash: String,
@@ -30,13 +38,38 @@ pub enum ContinuityData {
         charging_case: bool,
         lid_open: bool,
     },
+    /// Type 0x08 — Hey Siri.
+    HeySiri {
+        perceptual_hash: String,
+        snr: u8,
+        confidence: u8,
+        device_class: u16,
+        random_byte: u8,
+    },
     AirPlay {
         flags: u8,
         config_seed: u8,
     },
+    /// Type 0x0A — Tethering Target Presence.
+    TetheringTarget {
+        flags: u8,
+    },
+    /// Type 0x0B — Tethering Source Presence.
+    TetheringSource {
+        flags: u8,
+        battery: u8,
+        cell_service: u8,
+        cell_bars: u8,
+    },
     Handoff {
         activity_type: u16,
         payload_hash: String,
+    },
+    /// Type 0x0E — Proximity Pairing (separate from AirPods 0x07/0x12).
+    ProximityPairing {
+        prefix: u8,
+        device_model: u16,
+        raw: String,
     },
     NearbyInfo {
         activity_level: u8,
@@ -58,6 +91,11 @@ pub enum ContinuityData {
         charging_case: bool,
         lid_open: bool,
     },
+    /// Type 0x14 — Offline Finding (AirTag / FindMy network advertisement).
+    OfflineFinding {
+        status: u8,
+        public_key_hash: String,
+    },
     FindMy {
         status: u8,
     },
@@ -70,100 +108,38 @@ pub enum ContinuityData {
 impl ContinuityData {
     /// Parse Apple Continuity protocol data from manufacturer data bytes.
     ///
-    /// The data format is TLV: type (1 byte), length (1 byte), value (length bytes).
-    /// We parse the first TLV entry. Defensive: never panics on short data.
+    /// Returns the first TLV entry; kept for backward compatibility. Prefer
+    /// [`ContinuityData::parse_all`] which yields every entry in the payload.
+    #[allow(dead_code)]
     pub fn parse(data: &[u8]) -> Option<ContinuityData> {
-        if data.len() < 2 {
-            return None;
+        Self::parse_all(data).into_iter().next()
+    }
+
+    /// Parse all TLV entries in an Apple Continuity payload. Each TLV is
+    /// `type (1 byte) + length (1 byte) + value (length bytes)`. A single
+    /// advertisement frequently carries several TLVs (e.g. NearbyInfo + AirPlay
+    /// + Handoff together); previously we only returned the first.
+    pub fn parse_all(data: &[u8]) -> Vec<ContinuityData> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < data.len() {
+            let type_byte = data[i];
+            let length = data[i + 1] as usize;
+            let payload_start = i + 2;
+            let payload_end = payload_start.saturating_add(length).min(data.len());
+            let payload = &data[payload_start..payload_end];
+            if let Some(parsed) = parse_tlv(type_byte, payload) {
+                out.push(parsed);
+            }
+            // Advance past the (declared) TLV length even on parse failure so a
+            // single bad entry doesn't strand the rest of the payload.
+            let next = payload_start.saturating_add(length);
+            if next <= i {
+                break;
+            }
+            i = next;
         }
-        let type_byte = data[0];
-        let length = data[1] as usize;
-        let payload = if data.len() >= 2 + length {
-            &data[2..2 + length]
-        } else {
-            &data[2..]
-        };
-
-        Some(match type_byte {
-            0x02 if payload.len() >= 21 => {
-                let uuid = format!(
-                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    payload[0], payload[1], payload[2], payload[3],
-                    payload[4], payload[5],
-                    payload[6], payload[7],
-                    payload[8], payload[9],
-                    payload[10], payload[11], payload[12], payload[13], payload[14], payload[15],
-                );
-                let major = u16::from_be_bytes([payload[16], payload[17]]);
-                let minor = u16::from_be_bytes([payload[18], payload[19]]);
-                let measured_power = payload[20] as i8;
-                ContinuityData::IBeacon {
-                    uuid,
-                    major,
-                    minor,
-                    measured_power,
-                }
-            }
-
-            0x05 if payload.len() >= 2 => ContinuityData::AirDrop {
-                contact_hash: format!("{:02X}{:02X}", payload[0], payload[1]),
-            },
-
-            0x06 if payload.len() >= 2 => ContinuityData::HomeKit {
-                device_category: payload[0],
-                state: payload[1],
-            },
-
-            0x07 if payload.len() >= 5 => parse_airpods(payload, false),
-
-            0x09 if payload.len() >= 2 => ContinuityData::AirPlay {
-                flags: payload[0],
-                config_seed: payload[1],
-            },
-
-            0x0C if payload.len() >= 4 => {
-                let activity_type = u16::from_be_bytes([payload[0], payload[1]]);
-                let payload_hash = format!("{:02X}{:02X}", payload[2], payload[3]);
-                ContinuityData::Handoff {
-                    activity_type,
-                    payload_hash,
-                }
-            }
-
-            0x0F if payload.len() >= 2 => {
-                let status_flags = payload[0];
-                let activity_level = status_flags & 0x03;
-                let wifi_on = (status_flags & 0x04) != 0;
-                let os_version_hint = payload[1] >> 4;
-                let device_model = payload[1] & 0x0F;
-                ContinuityData::NearbyInfo {
-                    activity_level,
-                    wifi_on,
-                    os_version_hint,
-                    device_model,
-                }
-            }
-
-            0x10 if payload.len() >= 2 => ContinuityData::NearbyAction {
-                action_type: payload[0],
-                flags: payload[1],
-            },
-
-            0x12 if payload.len() >= 5 => parse_airpods(payload, true),
-
-            0x19 if !payload.is_empty() => ContinuityData::FindMy {
-                status: payload[0],
-            },
-
-            _ => {
-                let raw = data
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                ContinuityData::Unknown { type_byte, raw }
-            }
-        })
+        out
     }
 
     /// One-line human-readable summary for TUI display.
@@ -240,10 +216,7 @@ impl ContinuityData {
                 parts.join(" ")
             }
 
-            ContinuityData::AirPlay {
-                flags,
-                config_seed,
-            } => {
+            ContinuityData::AirPlay { flags, config_seed } => {
                 format!("AirPlay flags:{flags:#04X} seed:{config_seed}")
             }
 
@@ -271,10 +244,7 @@ impl ContinuityData {
                 format!("Nearby {activity} {wifi} os:{os_version_hint} dev:{device_model}")
             }
 
-            ContinuityData::NearbyAction {
-                action_type,
-                flags,
-            } => {
+            ContinuityData::NearbyAction { action_type, flags } => {
                 let action = nearby_action_name(*action_type);
                 format!("Action: {action} flags:{flags:#04X}")
             }
@@ -283,11 +253,218 @@ impl ContinuityData {
                 format!("FindMy status:{status:#04X}")
             }
 
+            ContinuityData::ModemNote { flags } => {
+                format!("ModemNote flags:{flags:#04X}")
+            }
+
+            ContinuityData::Watch { flags } => {
+                format!("Watch flags:{flags:#04X}")
+            }
+
+            ContinuityData::HeySiri {
+                snr,
+                confidence,
+                device_class,
+                ..
+            } => {
+                format!(
+                    "HeySiri snr:{snr} conf:{confidence} class:{device_class:#06X}"
+                )
+            }
+
+            ContinuityData::TetheringTarget { flags } => {
+                format!("TetheringTarget flags:{flags:#04X}")
+            }
+
+            ContinuityData::TetheringSource {
+                battery,
+                cell_service,
+                cell_bars,
+                ..
+            } => {
+                format!(
+                    "TetheringSource batt:{battery}% cell:{cell_service} bars:{cell_bars}"
+                )
+            }
+
+            ContinuityData::ProximityPairing { device_model, .. } => {
+                let model = airpods_model_name(*device_model);
+                format!("ProximityPair {model} (0x{device_model:04X})")
+            }
+
+            ContinuityData::OfflineFinding {
+                status,
+                public_key_hash,
+            } => {
+                format!("OfflineFinding status:{status:#04X} key:{public_key_hash}")
+            }
+
             ContinuityData::Unknown { type_byte, raw } => {
                 format!("Apple type:{type_byte:#04X} {raw}")
             }
         }
     }
+}
+
+/// Parse a single TLV payload by type byte. Returns None if the payload is
+/// too short for the declared type — caller still advances past it so any
+/// trailing TLVs in a multi-entry advertisement are still parsed.
+fn parse_tlv(type_byte: u8, payload: &[u8]) -> Option<ContinuityData> {
+    Some(match type_byte {
+        0x02 if payload.len() >= 21 => {
+            let uuid = format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                payload[0], payload[1], payload[2], payload[3],
+                payload[4], payload[5],
+                payload[6], payload[7],
+                payload[8], payload[9],
+                payload[10], payload[11], payload[12], payload[13], payload[14], payload[15],
+            );
+            let major = u16::from_be_bytes([payload[16], payload[17]]);
+            let minor = u16::from_be_bytes([payload[18], payload[19]]);
+            let measured_power = payload[20] as i8;
+            ContinuityData::IBeacon {
+                uuid,
+                major,
+                minor,
+                measured_power,
+            }
+        }
+
+        0x03 if !payload.is_empty() => ContinuityData::ModemNote { flags: payload[0] },
+
+        0x04 if !payload.is_empty() => ContinuityData::Watch { flags: payload[0] },
+
+        0x05 if payload.len() >= 2 => ContinuityData::AirDrop {
+            contact_hash: format!("{:02X}{:02X}", payload[0], payload[1]),
+        },
+
+        0x06 if payload.len() >= 2 => ContinuityData::HomeKit {
+            device_category: payload[0],
+            state: payload[1],
+        },
+
+        0x07 if payload.len() >= 5 => parse_airpods(payload, false),
+
+        0x08 if payload.len() >= 5 => {
+            // Layout (Apple Hey Siri):
+            //   [0:2] perceptual hash (BE u16)
+            //   [2]   SNR
+            //   [3]   confidence
+            //   [4]   device class (low byte) — full class spans 2 bytes if present
+            //   [5]   random byte (if present)
+            let perceptual_hash = format!("{:02X}{:02X}", payload[0], payload[1]);
+            let snr = payload[2];
+            let confidence = payload[3];
+            let device_class = if payload.len() >= 6 {
+                u16::from_be_bytes([payload[4], payload[5]])
+            } else {
+                payload[4] as u16
+            };
+            let random_byte = payload.get(6).copied().unwrap_or(0);
+            ContinuityData::HeySiri {
+                perceptual_hash,
+                snr,
+                confidence,
+                device_class,
+                random_byte,
+            }
+        }
+
+        0x09 if payload.len() >= 2 => ContinuityData::AirPlay {
+            flags: payload[0],
+            config_seed: payload[1],
+        },
+
+        0x0A if !payload.is_empty() => {
+            ContinuityData::TetheringTarget { flags: payload[0] }
+        }
+
+        0x0B if payload.len() >= 4 => {
+            // Layout (Apple Tethering Source):
+            //   [0]    flags
+            //   [1]    battery percent (0-100)
+            //   [2]    cell service indicator
+            //   [3]    cell bars (0-4)
+            ContinuityData::TetheringSource {
+                flags: payload[0],
+                battery: payload[1],
+                cell_service: payload[2],
+                cell_bars: payload[3],
+            }
+        }
+
+        0x0C if payload.len() >= 4 => {
+            let activity_type = u16::from_be_bytes([payload[0], payload[1]]);
+            let payload_hash = format!("{:02X}{:02X}", payload[2], payload[3]);
+            ContinuityData::Handoff {
+                activity_type,
+                payload_hash,
+            }
+        }
+
+        0x0E if payload.len() >= 3 => {
+            let prefix = payload[0];
+            let device_model = u16::from_be_bytes([payload[1], payload[2]]);
+            let raw = payload
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            ContinuityData::ProximityPairing {
+                prefix,
+                device_model,
+                raw,
+            }
+        }
+
+        0x0F if payload.len() >= 2 => {
+            let status_flags = payload[0];
+            let activity_level = status_flags & 0x03;
+            let wifi_on = (status_flags & 0x04) != 0;
+            let os_version_hint = payload[1] >> 4;
+            let device_model = payload[1] & 0x0F;
+            ContinuityData::NearbyInfo {
+                activity_level,
+                wifi_on,
+                os_version_hint,
+                device_model,
+            }
+        }
+
+        0x10 if payload.len() >= 2 => ContinuityData::NearbyAction {
+            action_type: payload[0],
+            flags: payload[1],
+        },
+
+        0x12 if payload.len() >= 5 => parse_airpods(payload, true),
+
+        0x14 if payload.len() >= 3 => {
+            let status = payload[0];
+            // Remaining bytes are a hash of the public key used for FindMy
+            // offline-finding. We hex-encode the first 8 bytes for display.
+            let key_bytes = &payload[1..payload.len().min(9)];
+            let public_key_hash = key_bytes
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<String>();
+            ContinuityData::OfflineFinding {
+                status,
+                public_key_hash,
+            }
+        }
+
+        0x19 if !payload.is_empty() => ContinuityData::FindMy { status: payload[0] },
+
+        _ => {
+            let raw = payload
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            ContinuityData::Unknown { type_byte, raw }
+        }
+    })
 }
 
 /// Parse AirPods/Beats proximity data from Continuity payload.
@@ -299,7 +476,11 @@ impl ContinuityData {
 ///   [4]   lid open (bit 0)
 /// Decode a 4-bit battery nibble (0–10 valid, >10 means unknown).
 fn decode_battery_nibble(nibble: u8) -> Option<u8> {
-    if nibble <= 10 { Some(nibble) } else { None }
+    if nibble <= 10 {
+        Some(nibble)
+    } else {
+        None
+    }
 }
 
 fn parse_airpods(payload: &[u8], extended: bool) -> ContinuityData {
@@ -364,6 +545,63 @@ fn airpods_model_name(model: u16) -> &'static str {
         0x0B20 => "Powerbeats Pro",
         _ => "AirPods/Beats",
     }
+}
+
+fn airpods_vendor_name(model: u16) -> &'static str {
+    match model {
+        0x0520 | 0x0620 | 0x0920 | 0x1020 | 0x1120 | 0x0320 | 0x0B20 => "Beats",
+        _ => "Apple",
+    }
+}
+
+/// Best-effort vendor hint from parsed Apple Continuity data.
+pub fn vendor_hint(data: &ContinuityData) -> &'static str {
+    match data {
+        ContinuityData::AirPods { device_model, .. }
+        | ContinuityData::AirPodsExtended { device_model, .. }
+        | ContinuityData::ProximityPairing { device_model, .. } => {
+            airpods_vendor_name(*device_model)
+        }
+        _ => "Apple",
+    }
+}
+
+/// Pick the most specific vendor hint from a list of TLVs. Prefers a non-Apple
+/// hint (e.g. "Beats") over the generic "Apple" fallback when both are present.
+pub fn vendor_hint_from_all(items: &[ContinuityData]) -> Option<&'static str> {
+    if items.is_empty() {
+        return None;
+    }
+    items
+        .iter()
+        .map(vendor_hint)
+        .find(|v| *v != "Apple")
+        .or_else(|| items.first().map(vendor_hint))
+}
+
+/// Format a multi-TLV continuity payload as a single line; entries joined with `; `.
+pub fn summary_all(items: &[ContinuityData]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    Some(
+        items
+            .iter()
+            .map(|c| c.summary())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// Find the iBeacon measured-power calibration value if any TLV is an iBeacon.
+pub fn ibeacon_measured_power(items: &[ContinuityData]) -> Option<i8> {
+    items.iter().find_map(|c| {
+        if let ContinuityData::IBeacon { measured_power, .. } = c {
+            Some(*measured_power)
+        } else {
+            None
+        }
+    })
 }
 
 fn homekit_category_name(cat: u8) -> &'static str {
@@ -438,7 +676,12 @@ mod tests {
         data.push(0xC5);
         let parsed = ContinuityData::parse(&data).unwrap();
         match parsed {
-            ContinuityData::IBeacon { major, minor, measured_power, .. } => {
+            ContinuityData::IBeacon {
+                major,
+                minor,
+                measured_power,
+                ..
+            } => {
                 assert_eq!(major, 1);
                 assert_eq!(minor, 2);
                 assert_eq!(measured_power, -59);
@@ -453,7 +696,13 @@ mod tests {
         let data = vec![0x07, 0x05, 0x02, 0x20, 0x8A, 0x50, 0x01];
         let parsed = ContinuityData::parse(&data).unwrap();
         match parsed {
-            ContinuityData::AirPods { device_model, battery_left, battery_right, lid_open, .. } => {
+            ContinuityData::AirPods {
+                device_model,
+                battery_left,
+                battery_right,
+                lid_open,
+                ..
+            } => {
                 assert_eq!(device_model, 0x0220);
                 assert_eq!(battery_left, Some(8));
                 assert_eq!(battery_right, Some(10));
@@ -480,7 +729,10 @@ mod tests {
         let data = vec![0x0C, 0x04, 0x01, 0x23, 0xAA, 0xBB];
         let parsed = ContinuityData::parse(&data).unwrap();
         match parsed {
-            ContinuityData::Handoff { activity_type, payload_hash } => {
+            ContinuityData::Handoff {
+                activity_type,
+                payload_hash,
+            } => {
                 assert_eq!(activity_type, 0x0123);
                 assert_eq!(payload_hash, "AABB");
             }
@@ -494,7 +746,12 @@ mod tests {
         let data = vec![0x0F, 0x02, 0x06, 0x53];
         let parsed = ContinuityData::parse(&data).unwrap();
         match parsed {
-            ContinuityData::NearbyInfo { activity_level, wifi_on, os_version_hint, device_model } => {
+            ContinuityData::NearbyInfo {
+                activity_level,
+                wifi_on,
+                os_version_hint,
+                device_model,
+            } => {
                 assert_eq!(activity_level, 2);
                 assert!(wifi_on);
                 assert_eq!(os_version_hint, 5);
@@ -547,7 +804,9 @@ mod tests {
 
     #[test]
     fn summary_airdrop() {
-        let d = ContinuityData::AirDrop { contact_hash: "ABCD".into() };
+        let d = ContinuityData::AirDrop {
+            contact_hash: "ABCD".into(),
+        };
         assert_eq!(d.summary(), "AirDrop contact:ABCD");
     }
 
@@ -559,7 +818,10 @@ mod tests {
 
     #[test]
     fn summary_nearby_action() {
-        let d = ContinuityData::NearbyAction { action_type: 0x09, flags: 0x00 };
+        let d = ContinuityData::NearbyAction {
+            action_type: 0x09,
+            flags: 0x00,
+        };
         assert!(d.summary().contains("WiFi Password"));
     }
 
@@ -574,6 +836,36 @@ mod tests {
     #[test]
     fn airpods_unknown_model() {
         assert_eq!(airpods_model_name(0xFFFF), "AirPods/Beats");
+    }
+
+    #[test]
+    fn vendor_hint_distinguishes_airpods_and_beats() {
+        assert_eq!(
+            vendor_hint(&ContinuityData::AirPods {
+                device_model: 0x0220,
+                battery_left: None,
+                battery_right: None,
+                battery_case: None,
+                charging_left: false,
+                charging_right: false,
+                charging_case: false,
+                lid_open: false,
+            }),
+            "Apple"
+        );
+        assert_eq!(
+            vendor_hint(&ContinuityData::AirPods {
+                device_model: 0x0B20,
+                battery_left: None,
+                battery_right: None,
+                battery_case: None,
+                charging_left: false,
+                charging_right: false,
+                charging_case: false,
+                lid_open: false,
+            }),
+            "Beats"
+        );
     }
 
     // ── homekit_category_name ────────────────────────────────────────────
@@ -602,7 +894,10 @@ mod tests {
 
     #[test]
     fn ibeacon_unknown_uuid() {
-        assert_eq!(ibeacon_uuid_name("00000000-0000-0000-0000-000000000000"), None);
+        assert_eq!(
+            ibeacon_uuid_name("00000000-0000-0000-0000-000000000000"),
+            None
+        );
     }
 
     // ── nearby_action_name ───────────────────────────────────────────────

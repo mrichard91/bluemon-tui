@@ -53,7 +53,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.chat_mode {
         let chunks = Layout::vertical([
             Constraint::Length(1), // header
-            Constraint::Min(5),   // chat messages
+            Constraint::Min(5),    // chat messages
             Constraint::Length(1), // input
             Constraint::Length(1), // footer
         ])
@@ -67,7 +67,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let area = f.area();
         let chunks = Layout::vertical([
             Constraint::Length(1), // header
-            Constraint::Min(5),   // table
+            Constraint::Min(5),    // table
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -206,7 +206,9 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
             };
 
             // Hourly activity sparkline
-            let activity = app.hourly_cache.get(fp)
+            let activity = app
+                .hourly_cache
+                .get(fp)
                 .map(|counts| crate::app::format_hourly_sparkline(counts))
                 .unwrap_or_default();
 
@@ -233,16 +235,16 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(7),  // Dist
         Constraint::Length(5),  // Type
         Constraint::Length(16), // MAC
-        Constraint::Min(10),   // Vendor
-        Constraint::Min(8),    // Name
-        Constraint::Min(10),   // Svcs
+        Constraint::Min(10),    // Vendor
+        Constraint::Min(8),     // Name
+        Constraint::Min(10),    // Svcs
         Constraint::Length(5),  // RSSI
         Constraint::Length(4),  // Seen
         Constraint::Length(8),  // FP
         Constraint::Length(13), // First Seen
         Constraint::Length(8),  // Last Seen
         Constraint::Length(24), // Activity
-        Constraint::Min(6),    // Note
+        Constraint::Min(6),     // Note
     ];
 
     let table = Table::new(rows, widths)
@@ -295,8 +297,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         );
     } else if let Some((msg, _)) = &app.probe_status {
         f.render_widget(
-            Paragraph::new(msg.as_str())
-                .style(Style::default().fg(Color::Cyan)),
+            Paragraph::new(msg.as_str()).style(Style::default().fg(Color::Cyan)),
             area,
         );
     } else {
@@ -365,8 +366,16 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         agg.representative_mac.clone()
     };
     lines.push(detail_line("MAC:         ", mac_display, vs));
-    lines.push(detail_line("Name:        ", agg.name.as_deref().unwrap_or("(none)"), vs));
-    lines.push(detail_line("Vendor:      ", agg.vendor.as_deref().unwrap_or("(unknown)"), vs));
+    lines.push(detail_line(
+        "Name:        ",
+        agg.name.as_deref().unwrap_or("(none)"),
+        vs,
+    ));
+    lines.push(detail_line(
+        "Vendor:      ",
+        agg.vendor.as_deref().unwrap_or("(unknown)"),
+        vs,
+    ));
     lines.push(detail_line(
         "Type:        ",
         format!("{} {}", agg.device_type.icon(), agg.device_type.label()),
@@ -378,26 +387,61 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         .map(|r| format!("{r} dBm"))
         .unwrap_or_else(|| "(none)".to_string());
     let dist_str = format_distance(agg.rssi, agg.tx_power, agg.ibeacon_measured_power);
-    lines.push(detail_line("RSSI:        ", format!("{rssi_str}  (Dist: {dist_str})"), vs));
-    lines.push(detail_line("First Seen:  ", format_compact(agg.first_seen), vs));
-    lines.push(detail_line("Last Seen:   ", format_relative(agg.last_seen), vs));
+    lines.push(detail_line(
+        "RSSI:        ",
+        format!("{rssi_str}  (Dist: {dist_str})"),
+        vs,
+    ));
+    lines.push(detail_line(
+        "First Seen:  ",
+        format_compact(agg.first_seen),
+        vs,
+    ));
+    lines.push(detail_line(
+        "Last Seen:   ",
+        format_relative(agg.last_seen),
+        vs,
+    ));
     lines.push(detail_line("Sightings:   ", agg.sightings.to_string(), vs));
     if let Some(addr_type) = agg.addr_type {
         let (label, color) = match addr_type {
             crate::classifier::BleAddrType::Public => ("Public (OUI-assigned)", Color::Green),
             crate::classifier::BleAddrType::RandomStatic => ("Random Static", Color::Yellow),
-            crate::classifier::BleAddrType::ResolvablePrivate => ("Resolvable Private (RPA)", Color::Yellow),
-            crate::classifier::BleAddrType::NonResolvablePrivate => ("Non-Resolvable Private", Color::Red),
+            crate::classifier::BleAddrType::ResolvablePrivate => {
+                ("Resolvable Private (RPA)", Color::Yellow)
+            }
+            crate::classifier::BleAddrType::NonResolvablePrivate => {
+                ("Non-Resolvable Private", Color::Red)
+            }
             crate::classifier::BleAddrType::Multicast => ("Multicast (anomalous)", Color::Red),
         };
-        lines.push(detail_line("Addr Type:   ", label, Style::default().fg(color)));
+        lines.push(detail_line(
+            "Addr Type:   ",
+            label,
+            Style::default().fg(color),
+        ));
     }
     if let Some(note) = &agg.note {
         lines.push(detail_line("Note:        ", note.clone(), vs));
     }
 
-    // Continuity / iBeacon section
-    if let Some(ContinuityData::IBeacon { uuid, major, minor, measured_power }) = dev.and_then(|d| d.continuity.as_ref()) {
+    // Continuity / iBeacon section. A single advertisement can carry several
+    // TLVs at once (e.g. iBeacon + NearbyInfo); show the iBeacon block expanded
+    // and list every other TLV's summary line beneath it.
+    let continuity_entries: &[ContinuityData] = match dev {
+        Some(d) => d.continuity.as_slice(),
+        None => &[],
+    };
+    let ibeacon = continuity_entries.iter().find_map(|c| match c {
+        ContinuityData::IBeacon {
+            uuid,
+            major,
+            minor,
+            measured_power,
+        } => Some((uuid, *major, *minor, *measured_power)),
+        _ => None,
+    });
+    if let Some((uuid, major, minor, measured_power)) = ibeacon {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("-- iBeacon --", section_style)));
         let uuid_label = if let Some(name) = ibeacon_uuid_name(uuid) {
@@ -408,15 +452,42 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         lines.push(detail_line("  UUID:      ", uuid_label, vs));
         lines.push(detail_line("  Major:     ", major.to_string(), vs));
         lines.push(detail_line("  Minor:     ", minor.to_string(), vs));
-        lines.push(detail_line("  Measured:  ", format!("{measured_power} dBm"), vs));
-    } else if let Some(summary) = &agg.continuity_summary {
+        lines.push(detail_line(
+            "  Measured:  ",
+            format!("{measured_power} dBm"),
+            vs,
+        ));
+    }
+    let other_continuity: Vec<&ContinuityData> = continuity_entries
+        .iter()
+        .filter(|c| !matches!(c, ContinuityData::IBeacon { .. }))
+        .collect();
+    if !other_continuity.is_empty() {
         lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("-- Continuity --", section_style)));
+        for c in &other_continuity {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", c.summary()),
+                Style::default().fg(Color::Green),
+            )));
+        }
+    } else if ibeacon.is_none() {
+        if let Some(summary) = &agg.continuity_summary {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("-- Continuity --", section_style)));
+            lines.push(Line::from(Span::styled(
+                summary.clone(),
+                Style::default().fg(Color::Green),
+            )));
+        }
+    }
+
+    // Eddystone (parsed from service_data 0xFEAA)
+    if let Some(summary) = &agg.eddystone_summary {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("-- Eddystone --", section_style)));
         lines.push(Line::from(Span::styled(
-            "-- Continuity --",
-            section_style,
-        )));
-        lines.push(Line::from(Span::styled(
-            summary.clone(),
+            format!("  {summary}"),
             Style::default().fg(Color::Green),
         )));
     }
@@ -428,21 +499,36 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             "-- GATT Device Info --",
             section_style,
         )));
+        let appearance_str = gatt.appearance.map(|a| {
+            let name = gatt
+                .appearance_name
+                .clone()
+                .unwrap_or_else(|| "Other".into());
+            format!("{name} (0x{a:04X})")
+        });
         let gatt_fields: &[(&str, Option<String>)] = &[
             ("  Manufacturer: ", gatt.manufacturer_name.clone()),
             ("  Model:        ", gatt.model_number.clone()),
+            ("  Appearance:   ", appearance_str),
             ("  Firmware:     ", gatt.firmware_revision.clone()),
             ("  Hardware:     ", gatt.hardware_revision.clone()),
             ("  Software:     ", gatt.software_revision.clone()),
             ("  PnP ID:       ", gatt.pnp_id.clone()),
-            ("  Battery:      ", gatt.battery_level.map(|v| format!("{v}%"))),
+            (
+                "  Battery:      ",
+                gatt.battery_level.map(|v| format!("{v}%")),
+            ),
         ];
         for (label, value) in gatt_fields {
             if let Some(v) = value {
                 lines.push(detail_line(label, v.clone(), vs));
             }
         }
-        lines.push(detail_line("  Probed at:    ", gatt.probed_at.clone(), Style::default().fg(Color::DarkGray)));
+        lines.push(detail_line(
+            "  Probed at:    ",
+            gatt.probed_at.clone(),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
 
     // Fast Pair section
@@ -474,6 +560,32 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
                         Span::styled(hex, Style::default().fg(Color::DarkGray)),
                     ]));
                 }
+            }
+        }
+
+        // Service Data (Eddystone, SwitchBot, Tile, Mi Band, Swift Pair, etc.)
+        if !dev.service_data.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "-- Service Data --",
+                section_style,
+            )));
+            let mut entries: Vec<(&String, &Vec<u8>)> = dev.service_data.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (uuid, data) in entries {
+                let hex: String = data
+                    .iter()
+                    .map(|b| format!("{:02X}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let short_uuid = uuid.split('-').next().unwrap_or(uuid);
+                let name = crate::service_uuids::resolve(uuid)
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {short_uuid}{name}: "), ls),
+                    Span::styled(hex, Style::default().fg(Color::DarkGray)),
+                ]));
             }
         }
 
@@ -517,7 +629,11 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             _ => "Other",
         };
         lines.push(Line::from(""));
-        lines.push(detail_line("Device Class: ", format!("{major_str} ({major}/{minor}) [0x{dc:06X}]"), vs));
+        lines.push(detail_line(
+            "Device Class: ",
+            format!("{major_str} ({major}/{minor}) [0x{dc:06X}]"),
+            vs,
+        ));
     }
 
     // RSSI sparkline
@@ -527,31 +643,46 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             "-- RSSI Trend (recent) --",
             section_style,
         )));
-        let bars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-        let min_rssi = app.detail_rssi_history.iter().copied().min().unwrap_or(-100) as f64;
+        let bars = [
+            ' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}',
+            '\u{2587}', '\u{2588}',
+        ];
+        let min_rssi = app
+            .detail_rssi_history
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(-100) as f64;
         let max_rssi = app.detail_rssi_history.iter().copied().max().unwrap_or(-30) as f64;
         let range = max_rssi - min_rssi;
-        let sparkline: String = app.detail_rssi_history.iter().map(|&r| {
-            if range < 1.0 {
-                // All values identical — show mid-level bar instead of invisible
-                bars[4]
-            } else {
-                let norm = ((r as f64 - min_rssi) / range * 8.0) as usize;
-                bars[norm.min(8)]
-            }
-        }).collect();
+        let sparkline: String = app
+            .detail_rssi_history
+            .iter()
+            .map(|&r| {
+                if range < 1.0 {
+                    // All values identical — show mid-level bar instead of invisible
+                    bars[4]
+                } else {
+                    let norm = ((r as f64 - min_rssi) / range * 8.0) as usize;
+                    bars[norm.min(8)]
+                }
+            })
+            .collect();
         lines.push(Line::from(vec![
             Span::styled("  ", ls),
             Span::styled(sparkline, Style::default().fg(Color::Green)),
         ]));
         let last = app.detail_rssi_history.last().unwrap();
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  Range: {} to {} dBm  Latest: {} dBm  ({} samples)",
-                    min_rssi as i16, max_rssi as i16, last, app.detail_rssi_history.len()),
-                Style::default().fg(Color::DarkGray),
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  Range: {} to {} dBm  Latest: {} dBm  ({} samples)",
+                min_rssi as i16,
+                max_rssi as i16,
+                last,
+                app.detail_rssi_history.len()
             ),
-        ]));
+            Style::default().fg(Color::DarkGray),
+        )]));
     }
 
     // Hourly activity heatmap
@@ -562,24 +693,30 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             section_style,
         )));
         let max_count = *app.detail_hourly.iter().max().unwrap_or(&1) as f64;
-        let bars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-        let heatmap: String = app.detail_hourly.iter().map(|&c| {
-            if c == 0 { '\u{2581}' }
-            else {
-                let norm = (c as f64 / max_count * 8.0) as usize;
-                bars[norm.min(8)]
-            }
-        }).collect();
+        let bars = [
+            ' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}',
+            '\u{2587}', '\u{2588}',
+        ];
+        let heatmap: String = app
+            .detail_hourly
+            .iter()
+            .map(|&c| {
+                if c == 0 {
+                    '\u{2581}'
+                } else {
+                    let norm = (c as f64 / max_count * 8.0) as usize;
+                    bars[norm.min(8)]
+                }
+            })
+            .collect();
         lines.push(Line::from(vec![
             Span::styled("  ", ls),
             Span::styled(heatmap, Style::default().fg(Color::Magenta)),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  0     6     12    18    23"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "  0     6     12    18  23".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )]));
     }
 
     // MAC rotation stats
@@ -590,7 +727,11 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
                 "-- MAC Rotation --",
                 section_style,
             )));
-            lines.push(detail_line("  Total MACs: ", rot.total_macs.to_string(), vs));
+            lines.push(detail_line(
+                "  Total MACs: ",
+                rot.total_macs.to_string(),
+                vs,
+            ));
             if let Some(avg) = rot.avg_rotation_mins {
                 let avg_str = if avg < 60.0 {
                     format!("{:.0} min", avg)
@@ -620,7 +761,9 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(Color::Cyan));
 
     f.render_widget(
-        Paragraph::new(visible).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(visible)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         popup_area,
     );
 }

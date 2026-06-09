@@ -4,6 +4,7 @@
 //! Service UUIDs > Manufacturer data > Name patterns > Device class > Vendor patterns.
 //! Also computes stable fingerprints for correlating randomized MAC addresses.
 
+use crate::{continuity, continuity::ContinuityData, fast_pair};
 use ratatui::style::Color;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -248,6 +249,71 @@ pub fn best_company_name(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<St
     Some(format!("BT#{:04X}", id))
 }
 
+/// Get the best manufacturer company name that looks like an actual device vendor
+/// instead of a generic chipset supplier.
+pub fn best_identity_company_name(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<String> {
+    for &id in manufacturer_data.keys() {
+        if company_device_type(id).is_some() {
+            if let Some(name) = company_name(id) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Refine a vendor string with stronger hints from parsed Continuity or Fast Pair data.
+pub fn refine_vendor(
+    current_vendor: Option<&str>,
+    continuity: &[ContinuityData],
+    fast_pair_model: Option<&str>,
+) -> Option<String> {
+    continuity::vendor_hint_from_all(continuity)
+        .map(str::to_string)
+        .or_else(|| {
+            fast_pair_model
+                .and_then(fast_pair::vendor_hint)
+                .map(str::to_string)
+        })
+        .or_else(|| current_vendor.map(str::to_string))
+}
+
+fn hash_identity_hints(manufacturer_data: &HashMap<u16, Vec<u8>>, hasher: &mut impl Hasher) {
+    if let Some(data) = manufacturer_data.get(&0x004C) {
+        for parsed in ContinuityData::parse_all(data) {
+            match parsed {
+                ContinuityData::IBeacon {
+                    uuid, major, minor, ..
+                } => {
+                    uuid.hash(hasher);
+                    major.hash(hasher);
+                    minor.hash(hasher);
+                }
+                ContinuityData::HomeKit {
+                    device_category, ..
+                } => {
+                    device_category.hash(hasher);
+                }
+                ContinuityData::AirPods { device_model, .. }
+                | ContinuityData::AirPodsExtended { device_model, .. }
+                | ContinuityData::ProximityPairing { device_model, .. } => {
+                    device_model.hash(hasher);
+                }
+                ContinuityData::NearbyInfo { device_model, .. } => {
+                    device_model.hash(hasher);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(data) = manufacturer_data.get(&0x00E0) {
+        if let Some(model_id) = fast_pair::model_id(data) {
+            model_id.hash(hasher);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Apple manufacturer data parsing (company ID 0x004C)
 //
@@ -260,12 +326,12 @@ fn classify_apple_mfr_data(data: &[u8]) -> DeviceType {
         return DeviceType::Phone;
     }
     match data[0] {
-        0x02 => DeviceType::SmartHome,  // iBeacon
+        0x02 => DeviceType::SmartHome,    // iBeacon
         0x07 | 0x12 => DeviceType::Audio, // AirPods/Beats proximity pairing
-        0x09 => DeviceType::Speaker,    // AirPlay target
-        0x0C => DeviceType::Computer,   // Handoff (Mac/iPad)
-        0x19 => DeviceType::SmartHome,  // FindMy / AirTag
-        _ => DeviceType::Phone,         // Default Apple = phone
+        0x09 => DeviceType::Speaker,      // AirPlay target
+        0x0C => DeviceType::Computer,     // Handoff (Mac/iPad)
+        0x19 => DeviceType::SmartHome,    // FindMy / AirTag
+        _ => DeviceType::Phone,           // Default Apple = phone
     }
 }
 
@@ -310,40 +376,40 @@ fn classify_by_device_class(device_class: u32) -> Option<DeviceType> {
 // ---------------------------------------------------------------------------
 const SERVICE_UUID_PATTERNS: &[(&str, DeviceType)] = &[
     // Wearables / Fitness
-    ("0000180d", DeviceType::Wearable),  // Heart Rate
-    ("0000181c", DeviceType::Wearable),  // User Data
-    ("00001814", DeviceType::Wearable),  // Running Speed
-    ("00001816", DeviceType::Wearable),  // Cycling Speed
-    ("00001818", DeviceType::Wearable),  // Cycling Power
-    ("0000181b", DeviceType::Wearable),  // Body Composition
-    ("0000181d", DeviceType::Wearable),  // Weight Scale
+    ("0000180d", DeviceType::Wearable), // Heart Rate
+    ("0000181c", DeviceType::Wearable), // User Data
+    ("00001814", DeviceType::Wearable), // Running Speed
+    ("00001816", DeviceType::Wearable), // Cycling Speed
+    ("00001818", DeviceType::Wearable), // Cycling Power
+    ("0000181b", DeviceType::Wearable), // Body Composition
+    ("0000181d", DeviceType::Wearable), // Weight Scale
     // Health
-    ("00001810", DeviceType::Wearable),  // Blood Pressure
-    ("00001808", DeviceType::Wearable),  // Glucose
-    ("00001809", DeviceType::Wearable),  // Health Thermometer
+    ("00001810", DeviceType::Wearable), // Blood Pressure
+    ("00001808", DeviceType::Wearable), // Glucose
+    ("00001809", DeviceType::Wearable), // Health Thermometer
     // Audio
-    ("0000110b", DeviceType::Audio),     // A2DP Sink
-    ("0000110a", DeviceType::Audio),     // A2DP Source
-    ("0000111e", DeviceType::Audio),     // Handsfree
-    ("0000111f", DeviceType::Audio),     // Handsfree AG
-    ("00001108", DeviceType::Audio),     // Headset
-    ("0000110d", DeviceType::Audio),     // Advanced Audio
-    ("00001203", DeviceType::Audio),     // Generic Audio
-    ("0000184e", DeviceType::Audio),     // Audio Stream Control
-    ("0000184f", DeviceType::Audio),     // Broadcast Audio
-    ("00001850", DeviceType::Audio),     // Published Audio
-    ("00001853", DeviceType::Audio),     // Common Audio
+    ("0000110b", DeviceType::Audio), // A2DP Sink
+    ("0000110a", DeviceType::Audio), // A2DP Source
+    ("0000111e", DeviceType::Audio), // Handsfree
+    ("0000111f", DeviceType::Audio), // Handsfree AG
+    ("00001108", DeviceType::Audio), // Headset
+    ("0000110d", DeviceType::Audio), // Advanced Audio
+    ("00001203", DeviceType::Audio), // Generic Audio
+    ("0000184e", DeviceType::Audio), // Audio Stream Control
+    ("0000184f", DeviceType::Audio), // Broadcast Audio
+    ("00001850", DeviceType::Audio), // Published Audio
+    ("00001853", DeviceType::Audio), // Common Audio
     // Gaming / HID
-    ("00001812", DeviceType::Gaming),    // HID
-    ("00001124", DeviceType::Gaming),    // HID legacy
+    ("00001812", DeviceType::Gaming), // HID
+    ("00001124", DeviceType::Gaming), // HID legacy
     // Apple
-    ("d0611e78", DeviceType::Phone),     // Apple Continuity
-    ("7905f431", DeviceType::Phone),     // Apple Notification Center
-    ("89d3502b", DeviceType::Phone),     // Apple Media Service
-    ("0000fd6f", DeviceType::Phone),     // Apple Continuity short
+    ("d0611e78", DeviceType::Phone), // Apple Continuity
+    ("7905f431", DeviceType::Phone), // Apple Notification Center
+    ("89d3502b", DeviceType::Phone), // Apple Media Service
+    ("0000fd6f", DeviceType::Phone), // Apple Continuity short
     // Google/Android
-    ("0000fe9f", DeviceType::Phone),     // Google Fast Pair
-    ("0000fe2c", DeviceType::Phone),     // Google Nearby
+    ("0000fe9f", DeviceType::Phone), // Google Fast Pair
+    ("0000fe2c", DeviceType::Phone), // Google Nearby
     // Smart Home / IoT
     ("0000181a", DeviceType::SmartHome), // Environmental Sensing
     ("0000fef5", DeviceType::SmartHome), // Philips Hue
@@ -355,31 +421,46 @@ const SERVICE_UUID_PATTERNS: &[(&str, DeviceType)] = &[
     ("0000febe", DeviceType::SmartHome), // Bose
     ("0000feec", DeviceType::SmartHome), // Tile
     // Location
-    ("00001819", DeviceType::Wearable),  // Location & Navigation
+    ("00001819", DeviceType::Wearable), // Location & Navigation
     // Watches
-    ("cba20d00", DeviceType::Watch),     // SwitchBot
-    ("0000fee0", DeviceType::Watch),     // Xiaomi Mi Band
-    ("0000feea", DeviceType::Watch),     // Swirl Networks
+    ("cba20d00", DeviceType::Watch), // SwitchBot
+    ("0000fee0", DeviceType::Watch), // Xiaomi Mi Band
+    ("0000feea", DeviceType::Watch), // Swirl Networks
     // Printers
-    ("00001118", DeviceType::Printer),   // Direct Printing
-    ("00001119", DeviceType::Printer),   // Reference Printing
+    ("00001118", DeviceType::Printer), // Direct Printing
+    ("00001119", DeviceType::Printer), // Reference Printing
     // Camera
-    ("00001822", DeviceType::Camera),    // Camera Profile
+    ("00001822", DeviceType::Camera), // Camera Profile
     // Vehicles
-    ("6f65732a", DeviceType::Vehicle),   // Rivian BLE
+    ("6f65732a", DeviceType::Vehicle), // Rivian BLE
 ];
 
 /// Name substring patterns → DeviceType (checked case-insensitively)
 const NAME_PATTERNS: &[(&[&str], DeviceType)] = &[
-    (&["iphone", "android", "pixel", "galaxy s", "galaxy z"], DeviceType::Phone),
+    (
+        &["iphone", "android", "pixel", "galaxy s", "galaxy z"],
+        DeviceType::Phone,
+    ),
     (&["ipad", "tab", "tablet"], DeviceType::Tablet),
-    (&["macbook", "thinkpad", "xps", "laptop"], DeviceType::Laptop),
-    (&["imac", "mac mini", "mac pro", "desktop"], DeviceType::Computer),
+    (
+        &["macbook", "thinkpad", "xps", "laptop"],
+        DeviceType::Laptop,
+    ),
+    (
+        &["imac", "mac mini", "mac pro", "desktop"],
+        DeviceType::Computer,
+    ),
     (&["watch", "band", "mi band"], DeviceType::Watch),
-    (&["airpod", "buds", "earbuds", "headphone"], DeviceType::Audio),
+    (
+        &["airpod", "buds", "earbuds", "headphone"],
+        DeviceType::Audio,
+    ),
     (&["homepod", "echo", "speaker"], DeviceType::Speaker),
     (&["tv", "roku", "firestick", "chromecast"], DeviceType::Tv),
-    (&["car", "vehicle", "model 3", "model y", "model s", "rivn"], DeviceType::Vehicle),
+    (
+        &["car", "vehicle", "model 3", "model y", "model s", "rivn"],
+        DeviceType::Vehicle,
+    ),
 ];
 
 /// Vendor substring patterns → DeviceType (checked case-insensitively)
@@ -670,6 +751,7 @@ pub fn compute_fingerprint(
             type_byte.hash(&mut hasher);
         }
     }
+    hash_identity_hints(manufacturer_data, &mut hasher);
 
     // Service UUIDs (sorted, first 8 chars for short UUIDs)
     let mut uuids: Vec<String> = service_uuids
@@ -741,6 +823,35 @@ mod tests {
         assert_eq!(best_company_name(&mfr), None);
     }
 
+    #[test]
+    fn best_identity_company_name_skips_generic_chipsets() {
+        let mut mfr = HashMap::new();
+        mfr.insert(0x000D, vec![]); // Texas Instruments
+        assert_eq!(best_identity_company_name(&mfr), None);
+    }
+
+    #[test]
+    fn refine_vendor_prefers_continuity_and_fast_pair_hints() {
+        let continuity = vec![ContinuityData::AirPods {
+            device_model: 0x0220,
+            battery_left: None,
+            battery_right: None,
+            battery_case: None,
+            charging_left: false,
+            charging_right: false,
+            charging_case: false,
+            lid_open: false,
+        }];
+        assert_eq!(
+            refine_vendor(Some("D-Link"), &continuity, None),
+            Some("Apple".to_string())
+        );
+        assert_eq!(
+            refine_vendor(Some("Google"), &[], Some("Galaxy Buds2 Pro")),
+            Some("Samsung".to_string())
+        );
+    }
+
     // ── is_randomized_mac ────────────────────────────────────────────────
 
     #[test]
@@ -766,31 +877,46 @@ mod tests {
     #[test]
     fn addr_type_public() {
         // 0xAC = 10101100 → bit1=0 (universal), bit0=0 (unicast)
-        assert_eq!(parse_addr_type("AC:DE:48:00:11:22"), Some(BleAddrType::Public));
+        assert_eq!(
+            parse_addr_type("AC:DE:48:00:11:22"),
+            Some(BleAddrType::Public)
+        );
     }
 
     #[test]
     fn addr_type_random_static() {
         // 0xDE = 11011110 → bit1=1 (local), top 2 bits = 11
-        assert_eq!(parse_addr_type("DE:AA:BB:CC:DD:EE"), Some(BleAddrType::RandomStatic));
+        assert_eq!(
+            parse_addr_type("DE:AA:BB:CC:DD:EE"),
+            Some(BleAddrType::RandomStatic)
+        );
     }
 
     #[test]
     fn addr_type_resolvable_private() {
         // 0x5E = 01011110 → bit1=1 (local), top 2 bits = 01
-        assert_eq!(parse_addr_type("5E:AA:BB:CC:DD:EE"), Some(BleAddrType::ResolvablePrivate));
+        assert_eq!(
+            parse_addr_type("5E:AA:BB:CC:DD:EE"),
+            Some(BleAddrType::ResolvablePrivate)
+        );
     }
 
     #[test]
     fn addr_type_non_resolvable() {
         // 0x1E = 00011110 → bit1=1 (local), top 2 bits = 00
-        assert_eq!(parse_addr_type("1E:AA:BB:CC:DD:EE"), Some(BleAddrType::NonResolvablePrivate));
+        assert_eq!(
+            parse_addr_type("1E:AA:BB:CC:DD:EE"),
+            Some(BleAddrType::NonResolvablePrivate)
+        );
     }
 
     #[test]
     fn addr_type_multicast() {
         // 0xAD = 10101101 → bit0=1 (multicast)
-        assert_eq!(parse_addr_type("AD:DE:48:00:11:22"), Some(BleAddrType::Multicast));
+        assert_eq!(
+            parse_addr_type("AD:DE:48:00:11:22"),
+            Some(BleAddrType::Multicast)
+        );
     }
 
     #[test]
@@ -849,6 +975,32 @@ mod tests {
         let fp = compute_fingerprint(None, &[], &mfr, None);
         assert_eq!(fp.len(), 4);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn fingerprint_uses_apple_model_identity() {
+        let mut airpods = HashMap::new();
+        airpods.insert(0x004C, vec![0x07, 0x05, 0x02, 0x20, 0x8A, 0x50, 0x01]);
+
+        let mut airpods_pro = HashMap::new();
+        airpods_pro.insert(0x004C, vec![0x07, 0x05, 0x0E, 0x20, 0x8A, 0x50, 0x01]);
+
+        let fp1 = compute_fingerprint(None, &[], &airpods, None);
+        let fp2 = compute_fingerprint(None, &[], &airpods_pro, None);
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_uses_fast_pair_model_identity() {
+        let mut buds = HashMap::new();
+        buds.insert(0x00E0, vec![0x00, 0x00, 0x47]);
+
+        let mut buds_pro = HashMap::new();
+        buds_pro.insert(0x00E0, vec![0x00, 0x00, 0xC0]);
+
+        let fp1 = compute_fingerprint(None, &[], &buds, None);
+        let fp2 = compute_fingerprint(None, &[], &buds_pro, None);
+        assert_ne!(fp1, fp2);
     }
 
     // ── classify_apple_mfr_data ──────────────────────────────────────────

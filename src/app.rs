@@ -7,28 +7,28 @@ use crate::chat::ChatState;
 use crate::classifier::{self as cls, DeviceType};
 use crate::config::Config;
 use crate::continuity::ContinuityData;
+use crate::eddystone::Eddystone;
 use crate::gatt::{self, GattDeviceInfo};
 use crate::scanner::ScanResult;
-use crate::{continuity, fast_pair};
+use crate::{continuity, eddystone, fast_pair};
 use chrono::{DateTime, Datelike, Local};
 use ratatui::widgets::TableState;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
-/// Path loss exponent for log-distance model. Loaded once from config/env.
-/// Set via `init_path_loss_n()` at startup, defaults to 3.0 (typical indoor).
-static PATH_LOSS_N: LazyLock<f64> = LazyLock::new(|| {
-    std::env::var("_BLUEMON_PATH_LOSS_N")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3.0)
-});
+/// Path loss exponent for the log-distance model. Defaults to 3.0 (typical indoor)
+/// when never initialized, e.g. in tests.
+static PATH_LOSS_N: OnceLock<f64> = OnceLock::new();
 
 /// Set the path loss exponent before any distance estimation occurs.
 /// Called once from main after loading config.
 pub fn init_path_loss_n(n: f64) {
-    std::env::set_var("_BLUEMON_PATH_LOSS_N", n.to_string());
+    let _ = PATH_LOSS_N.set(n);
+}
+
+fn path_loss_n() -> f64 {
+    *PATH_LOSS_N.get().unwrap_or(&3.0)
 }
 
 /// Per-MAC device record from BLE scanning. Contains all raw data captured
@@ -51,7 +51,13 @@ pub struct DeviceInfo {
     pub fingerprint: String,
     /// Only populated at scan time; empty after DB load.
     pub manufacturer_data: HashMap<u16, Vec<u8>>,
-    pub continuity: Option<ContinuityData>,
+    /// Service-data payloads keyed by service UUID (lowercase). Persisted as JSON.
+    pub service_data: HashMap<String, Vec<u8>>,
+    /// All Apple Continuity TLVs from the most recent advertisement. A single
+    /// ad frequently carries multiple entries (e.g. NearbyInfo + AirPlay).
+    pub continuity: Vec<ContinuityData>,
+    /// Parsed Eddystone frame from service_data, if present.
+    pub eddystone: Option<Eddystone>,
     pub gatt_info: Option<GattDeviceInfo>,
     pub fast_pair_model: Option<String>,
     /// Bluetooth Class of Device (24-bit field).
@@ -80,6 +86,7 @@ pub struct AggregatedDevice {
     pub device_class: Option<u32>,
     pub continuity_summary: Option<String>,
     pub ibeacon_measured_power: Option<i8>,
+    pub eddystone_summary: Option<String>,
     pub gatt_info: Option<GattDeviceInfo>,
     pub fast_pair_model: Option<String>,
 }
@@ -151,11 +158,15 @@ pub fn estimate_distance(rssi: i16, _tx_power: Option<i16>, ibeacon_power: Optio
         Some(ibp) => ibp as f64,
         None => -59.0,
     };
-    10_f64.powf((ref_power - rssi as f64) / (10.0 * *PATH_LOSS_N))
+    10_f64.powf((ref_power - rssi as f64) / (10.0 * path_loss_n()))
 }
 
 /// Format estimated distance for display.
-pub fn format_distance(rssi: Option<i16>, tx_power: Option<i16>, ibeacon_power: Option<i8>) -> String {
+pub fn format_distance(
+    rssi: Option<i16>,
+    tx_power: Option<i16>,
+    ibeacon_power: Option<i8>,
+) -> String {
     let Some(rssi) = rssi else {
         return "?".to_string();
     };
@@ -243,8 +254,10 @@ impl App {
         let fp = result.fingerprint.clone();
         let mac = result.mac.clone();
 
-        let entry = self.devices.entry(mac.clone()).or_insert_with(|| {
-            DeviceInfo {
+        let entry = self
+            .devices
+            .entry(mac.clone())
+            .or_insert_with(|| DeviceInfo {
                 mac: result.mac.clone(),
                 name: None,
                 rssi: None,
@@ -259,13 +272,14 @@ impl App {
                 note: None,
                 fingerprint: fp.clone(),
                 manufacturer_data: HashMap::new(),
-                continuity: None,
+                service_data: HashMap::new(),
+                continuity: Vec::new(),
+                eddystone: None,
                 gatt_info: None,
                 fast_pair_model: None,
                 device_class: result.device_class,
                 addr_type: cls::parse_addr_type(&result.mac),
-            }
-        });
+            });
 
         if result.name.is_some() {
             entry.name = result.name;
@@ -291,18 +305,35 @@ impl App {
             entry.device_class = result.device_class;
         }
 
-        // Store manufacturer data and parse enrichment fields
-        if !result.manufacturer_data.is_empty() {
-            entry.manufacturer_data = result.manufacturer_data.clone();
+        // Merge manufacturer data per company id; don't wipe entries from prior
+        // advertisements when this scan only carried a subset of company IDs.
+        for (company_id, data) in &result.manufacturer_data {
+            entry.manufacturer_data.insert(*company_id, data.clone());
+        }
+        // Same for service data — merge per-UUID rather than overwrite.
+        for (uuid, data) in &result.service_data {
+            entry.service_data.insert(uuid.clone(), data.clone());
         }
         if let Some(apple_data) = result.manufacturer_data.get(&0x004C) {
-            entry.continuity = continuity::ContinuityData::parse(apple_data);
+            let parsed = continuity::ContinuityData::parse_all(apple_data);
+            if !parsed.is_empty() {
+                entry.continuity = parsed;
+            }
         }
         if let Some(google_data) = result.manufacturer_data.get(&0x00E0) {
             if let Some(model) = fast_pair::lookup_model(google_data) {
                 entry.fast_pair_model = Some(model);
             }
         }
+        let parsed_eddystone = eddystone::from_service_data(&entry.service_data);
+        if parsed_eddystone.is_some() {
+            entry.eddystone = parsed_eddystone;
+        }
+        entry.vendor = cls::refine_vendor(
+            entry.vendor.as_deref(),
+            &entry.continuity,
+            entry.fast_pair_model.as_deref(),
+        );
 
         // Remove MAC from its old fingerprint group before updating
         let old_fp = std::mem::replace(&mut entry.fingerprint, fp.clone());
@@ -325,10 +356,7 @@ impl App {
         }
 
         // Track which MACs share this fingerprint
-        self.fingerprint_groups
-            .entry(fp)
-            .or_default()
-            .insert(mac);
+        self.fingerprint_groups.entry(fp).or_default().insert(mac);
     }
 
     /// Rebuild fingerprint groups from current device data (e.g. after DB load).
@@ -347,10 +375,8 @@ impl App {
     pub fn build_aggregated(&mut self) {
         self.aggregated.clear();
         for (fp, macs) in &self.fingerprint_groups {
-            let mut devs: Vec<&DeviceInfo> = macs
-                .iter()
-                .filter_map(|m| self.devices.get(m))
-                .collect();
+            let mut devs: Vec<&DeviceInfo> =
+                macs.iter().filter_map(|m| self.devices.get(m)).collect();
             if devs.is_empty() {
                 continue;
             }
@@ -364,11 +390,8 @@ impl App {
                 .find_map(|d| d.name.clone())
                 .or_else(|| devs.iter().find_map(|d| d.fast_pair_model.clone()))
                 .or_else(|| {
-                    devs.iter().find_map(|d| {
-                        d.gatt_info
-                            .as_ref()
-                            .and_then(|g| g.model_number.clone())
-                    })
+                    devs.iter()
+                        .find_map(|d| d.gatt_info.as_ref().and_then(|g| g.model_number.clone()))
                 });
             let vendor = devs.iter().find_map(|d| d.vendor.clone());
             let device_type = devs
@@ -396,20 +419,15 @@ impl App {
 
             let continuity_summary = devs
                 .iter()
-                .find_map(|d| d.continuity.as_ref().map(|c| c.summary()));
-            let ibeacon_measured_power = devs.iter().find_map(|d| {
-                if let Some(ContinuityData::IBeacon { measured_power, .. }) = &d.continuity {
-                    Some(*measured_power)
-                } else {
-                    None
-                }
-            });
-            let gatt_info = devs
+                .find_map(|d| continuity::summary_all(&d.continuity));
+            let ibeacon_measured_power = devs
                 .iter()
-                .find_map(|d| d.gatt_info.clone());
-            let fast_pair_model = devs
+                .find_map(|d| continuity::ibeacon_measured_power(&d.continuity));
+            let eddystone_summary = devs
                 .iter()
-                .find_map(|d| d.fast_pair_model.clone());
+                .find_map(|d| d.eddystone.as_ref().map(|e| e.summary()));
+            let gatt_info = devs.iter().find_map(|d| d.gatt_info.clone());
+            let fast_pair_model = devs.iter().find_map(|d| d.fast_pair_model.clone());
 
             self.aggregated.insert(
                 fp.clone(),
@@ -432,6 +450,7 @@ impl App {
                     device_class,
                     continuity_summary,
                     ibeacon_measured_power,
+                    eddystone_summary,
                     gatt_info,
                     fast_pair_model,
                 },
@@ -480,11 +499,17 @@ impl App {
             let db = &aggregated[b];
             let ord = match col {
                 SortColumn::Distance => {
-                    let dist_a = da.rssi.map(|r| estimate_distance(r, da.tx_power, da.ibeacon_measured_power));
-                    let dist_b = db.rssi.map(|r| estimate_distance(r, db.tx_power, db.ibeacon_measured_power));
+                    let dist_a = da
+                        .rssi
+                        .map(|r| estimate_distance(r, da.tx_power, da.ibeacon_measured_power));
+                    let dist_b = db
+                        .rssi
+                        .map(|r| estimate_distance(r, db.tx_power, db.ibeacon_measured_power));
                     // Closest first (default), None always last; tie-break by last_seen (newest first)
                     let cmp = match (dist_a, dist_b) {
-                        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                        (Some(a), Some(b)) => a
+                            .partial_cmp(&b)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                             .then(db.last_seen.cmp(&da.last_seen)),
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -501,7 +526,11 @@ impl App {
                 SortColumn::FirstSeen => da.first_seen.cmp(&db.first_seen),
                 SortColumn::LastSeen => da.last_seen.cmp(&db.last_seen),
             };
-            if asc { ord } else { ord.reverse() }
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
         });
 
         // Remember which fingerprint was selected so we can restore it
@@ -531,9 +560,8 @@ impl App {
                         .fingerprint_groups
                         .get(&fp)
                         .and_then(|macs| {
-                            macs.iter().find_map(|m| {
-                                self.devices.get(m).and_then(|d| d.note.clone())
-                            })
+                            macs.iter()
+                                .find_map(|m| self.devices.get(m).and_then(|d| d.note.clone()))
                         })
                         .unwrap_or_default();
                     self.note_mode = true;
@@ -679,15 +707,21 @@ pub fn format_hourly_sparkline(counts: &[u32; 24]) -> String {
     if max == 0.0 {
         return String::new();
     }
-    let bars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-    counts.iter().map(|&c| {
-        if c == 0 {
-            ' '
-        } else {
-            let norm = (c as f64 / max * 8.0) as usize;
-            bars[norm.clamp(1, 8)]
-        }
-    }).collect()
+    let bars = [
+        ' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    counts
+        .iter()
+        .map(|&c| {
+            if c == 0 {
+                ' '
+            } else {
+                let norm = (c as f64 / max * 8.0) as usize;
+                bars[norm.clamp(1, 8)]
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -703,7 +737,10 @@ mod tests {
     fn distance_default_ref_power() {
         // No tx_power, no ibeacon → default -59 dBm ref
         let d = estimate_distance(-59, None, None);
-        assert!((d - 1.0).abs() < 0.01, "At ref power, distance should be ~1m, got {d}");
+        assert!(
+            (d - 1.0).abs() < 0.01,
+            "At ref power, distance should be ~1m, got {d}"
+        );
     }
 
     #[test]
@@ -711,14 +748,20 @@ mod tests {
         // tx_power is not calibrated at 1m, so it should be ignored (uses default -59)
         let d_with_tx = estimate_distance(-59, Some(12), None);
         let d_without_tx = estimate_distance(-59, None, None);
-        assert!((d_with_tx - d_without_tx).abs() < 0.01, "tx_power should not affect distance");
+        assert!(
+            (d_with_tx - d_without_tx).abs() < 0.01,
+            "tx_power should not affect distance"
+        );
     }
 
     #[test]
     fn distance_ibeacon_takes_priority() {
         // ibeacon_power should override tx_power
         let d_ibeacon = estimate_distance(-70, Some(10), Some(-70));
-        assert!((d_ibeacon - 1.0).abs() < 0.01, "iBeacon power should be used as ref");
+        assert!(
+            (d_ibeacon - 1.0).abs() < 0.01,
+            "iBeacon power should be used as ref"
+        );
     }
 
     #[test]
@@ -784,6 +827,7 @@ mod tests {
             service_uuids: vec![],
             is_randomized: false,
             manufacturer_data: HashMap::new(),
+            service_data: HashMap::new(),
             device_class: None,
             fingerprint: "ABCD".to_string(),
         }
@@ -818,7 +862,10 @@ mod tests {
         let mut r = make_scan_result("AA:BB:CC:DD:EE:FF");
         r.name = Some("MyDevice".into());
         app.upsert_device(r);
-        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].name.as_deref(), Some("MyDevice"));
+        assert_eq!(
+            app.devices["AA:BB:CC:DD:EE:FF"].name.as_deref(),
+            Some("MyDevice")
+        );
     }
 
     #[test]
@@ -830,7 +877,10 @@ mod tests {
 
         // Second upsert with name=None should preserve existing name
         app.upsert_device(make_scan_result("AA:BB:CC:DD:EE:FF"));
-        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].name.as_deref(), Some("MyDevice"));
+        assert_eq!(
+            app.devices["AA:BB:CC:DD:EE:FF"].name.as_deref(),
+            Some("MyDevice")
+        );
     }
 
     #[test]
@@ -844,36 +894,104 @@ mod tests {
         assert!(group.contains("AA:BB:CC:DD:EE:02"));
     }
 
+    #[test]
+    fn upsert_refines_vendor_from_continuity() {
+        let mut app = App::new(":memory:".into(), &Config::default());
+        let mut r = make_scan_result("00:17:9A:11:22:33");
+        r.vendor = Some("D-Link".into());
+        r.manufacturer_data
+            .insert(0x004C, vec![0x07, 0x05, 0x02, 0x20, 0x8A, 0x50, 0x01]);
+        app.upsert_device(r);
+        assert_eq!(
+            app.devices["00:17:9A:11:22:33"].vendor.as_deref(),
+            Some("Apple")
+        );
+    }
+
     // ── rebuild_fingerprint_groups ───────────────────────────────────────
 
     #[test]
     fn rebuild_fingerprint_groups_from_devices() {
         let mut app = App::new(":memory:".into(), &Config::default());
         let now = Local::now();
-        app.devices.insert("MAC1".into(), DeviceInfo {
-            mac: "MAC1".into(), name: None, rssi: None, tx_power: None,
-            vendor: None, device_type: DeviceType::Unknown, service_uuids: vec![],
-            sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
-            note: None, fingerprint: "FP01".into(), manufacturer_data: HashMap::new(),
-            continuity: None, gatt_info: None, fast_pair_model: None,
-            device_class: None, addr_type: None,
-        });
-        app.devices.insert("MAC2".into(), DeviceInfo {
-            mac: "MAC2".into(), name: None, rssi: None, tx_power: None,
-            vendor: None, device_type: DeviceType::Unknown, service_uuids: vec![],
-            sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
-            note: None, fingerprint: "FP01".into(), manufacturer_data: HashMap::new(),
-            continuity: None, gatt_info: None, fast_pair_model: None,
-            device_class: None, addr_type: None,
-        });
-        app.devices.insert("MAC3".into(), DeviceInfo {
-            mac: "MAC3".into(), name: None, rssi: None, tx_power: None,
-            vendor: None, device_type: DeviceType::Unknown, service_uuids: vec![],
-            sightings: 1, first_seen: now, last_seen: now, is_randomized: false,
-            note: None, fingerprint: "".into(), manufacturer_data: HashMap::new(),
-            continuity: None, gatt_info: None, fast_pair_model: None,
-            device_class: None, addr_type: None,
-        });
+        app.devices.insert(
+            "MAC1".into(),
+            DeviceInfo {
+                mac: "MAC1".into(),
+                name: None,
+                rssi: None,
+                tx_power: None,
+                vendor: None,
+                device_type: DeviceType::Unknown,
+                service_uuids: vec![],
+                sightings: 1,
+                first_seen: now,
+                last_seen: now,
+                is_randomized: false,
+                note: None,
+                fingerprint: "FP01".into(),
+                manufacturer_data: HashMap::new(),
+                service_data: HashMap::new(),
+                continuity: Vec::new(),
+                eddystone: None,
+                gatt_info: None,
+                fast_pair_model: None,
+                device_class: None,
+                addr_type: None,
+            },
+        );
+        app.devices.insert(
+            "MAC2".into(),
+            DeviceInfo {
+                mac: "MAC2".into(),
+                name: None,
+                rssi: None,
+                tx_power: None,
+                vendor: None,
+                device_type: DeviceType::Unknown,
+                service_uuids: vec![],
+                sightings: 1,
+                first_seen: now,
+                last_seen: now,
+                is_randomized: false,
+                note: None,
+                fingerprint: "FP01".into(),
+                manufacturer_data: HashMap::new(),
+                service_data: HashMap::new(),
+                continuity: Vec::new(),
+                eddystone: None,
+                gatt_info: None,
+                fast_pair_model: None,
+                device_class: None,
+                addr_type: None,
+            },
+        );
+        app.devices.insert(
+            "MAC3".into(),
+            DeviceInfo {
+                mac: "MAC3".into(),
+                name: None,
+                rssi: None,
+                tx_power: None,
+                vendor: None,
+                device_type: DeviceType::Unknown,
+                service_uuids: vec![],
+                sightings: 1,
+                first_seen: now,
+                last_seen: now,
+                is_randomized: false,
+                note: None,
+                fingerprint: "".into(),
+                manufacturer_data: HashMap::new(),
+                service_data: HashMap::new(),
+                continuity: Vec::new(),
+                eddystone: None,
+                gatt_info: None,
+                fast_pair_model: None,
+                device_class: None,
+                addr_type: None,
+            },
+        );
 
         app.rebuild_fingerprint_groups();
 
@@ -896,7 +1014,10 @@ mod tests {
         app.note_input = "test note".into();
         let mac = app.save_note();
         assert_eq!(mac, Some("AA:BB:CC:DD:EE:FF".to_string()));
-        assert_eq!(app.devices["AA:BB:CC:DD:EE:FF"].note.as_deref(), Some("test note"));
+        assert_eq!(
+            app.devices["AA:BB:CC:DD:EE:FF"].note.as_deref(),
+            Some("test note")
+        );
         assert!(!app.note_mode);
     }
 

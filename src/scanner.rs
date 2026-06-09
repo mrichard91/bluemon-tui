@@ -5,7 +5,9 @@
 
 use crate::classifier::{self, DeviceType};
 use crate::vendor;
-use btleplug::api::{AddressType, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::api::{
+    AddressType, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter,
+};
 use btleplug::platform::{Adapter, Manager, PeripheralId};
 use futures::stream::StreamExt;
 use std::collections::HashMap;
@@ -14,6 +16,7 @@ use tokio::sync::mpsc;
 
 /// Device scan result built from a BLE advertisement.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct ScanResult {
     pub mac: String,
     pub name: Option<String>,
@@ -24,6 +27,10 @@ pub struct ScanResult {
     pub service_uuids: Vec<String>,
     pub is_randomized: bool,
     pub manufacturer_data: HashMap<u16, Vec<u8>>,
+    /// Service-data payloads keyed by service UUID (lowercase hex string).
+    /// Carries Eddystone, SwitchBot, Tile, Mi Band, Swift Pair, Fast Pair-extended
+    /// and other vendor data that doesn't ride in manufacturer_data.
+    pub service_data: HashMap<String, Vec<u8>>,
     pub device_class: Option<u32>,
     pub fingerprint: String,
 }
@@ -57,11 +64,23 @@ fn build_scan_result(props: btleplug::api::PeripheralProperties) -> ScanResult {
         None => classifier::is_randomized_mac(&mac),
     };
     let manufacturer_data = props.manufacturer_data;
+    let service_data: HashMap<String, Vec<u8>> = props
+        .service_data
+        .into_iter()
+        .map(|(uuid, bytes)| (uuid.to_string(), bytes))
+        .collect();
     let device_class = props.class;
     let tx_power = props.tx_power_level;
 
-    let oui_vendor = vendor::lookup_vendor(&mac);
-    let vendor = oui_vendor.or_else(|| classifier::best_company_name(&manufacturer_data));
+    let vendor = classifier::best_identity_company_name(&manufacturer_data)
+        .or_else(|| {
+            if is_randomized {
+                None
+            } else {
+                vendor::lookup_vendor(&mac)
+            }
+        })
+        .or_else(|| classifier::best_company_name(&manufacturer_data));
 
     let service_uuids: Vec<String> = props.services.iter().map(|u| u.to_string()).collect();
     let name = props.local_name;
@@ -91,6 +110,7 @@ fn build_scan_result(props: btleplug::api::PeripheralProperties) -> ScanResult {
         service_uuids,
         is_randomized,
         manufacturer_data,
+        service_data,
         device_class,
         fingerprint,
     }
@@ -124,7 +144,9 @@ pub async fn scan_loop(
         let mut events = match adapter.events().await {
             Ok(e) => e,
             Err(e) => {
-                let _ = tx.send(ScanMessage::Error(format!("Failed to get event stream: {e}")));
+                let _ = tx.send(ScanMessage::Error(format!(
+                    "Failed to get event stream: {e}"
+                )));
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -161,7 +183,9 @@ pub async fn scan_loop(
 
         // Event stream ended — stop scan and restart
         let _ = adapter.stop_scan().await;
-        let _ = tx.send(ScanMessage::Error("Event stream ended, restarting scan".into()));
+        let _ = tx.send(ScanMessage::Error(
+            "Event stream ended, restarting scan".into(),
+        ));
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -250,7 +274,10 @@ mod tests {
         );
         let result = build_scan_result(props);
         // The heuristic checks the second-least significant bit of the first octet
-        assert_eq!(result.is_randomized, classifier::is_randomized_mac(&result.mac));
+        assert_eq!(
+            result.is_randomized,
+            classifier::is_randomized_mac(&result.mac)
+        );
     }
 
     #[test]
@@ -281,6 +308,23 @@ mod tests {
         props.manufacturer_data.insert(0x004C, vec![0x01, 0x02]); // Apple
         let result = build_scan_result(props);
         assert!(result.manufacturer_data.contains_key(&0x004C));
+        assert_eq!(result.vendor.as_deref(), Some("Apple"));
+    }
+
+    #[test]
+    fn build_scan_result_randomized_prefers_company_over_oui() {
+        let mut props = make_props(
+            [0x00, 0x17, 0x9A, 0x11, 0x22, 0x33],
+            Some(AddressType::Random),
+            Some(-45),
+            None,
+            None,
+        );
+        props
+            .manufacturer_data
+            .insert(0x004C, vec![0x07, 0x05, 0x02, 0x20, 0x8A, 0x50, 0x01]);
+        let result = build_scan_result(props);
+        assert!(result.is_randomized);
         assert_eq!(result.vendor.as_deref(), Some("Apple"));
     }
 

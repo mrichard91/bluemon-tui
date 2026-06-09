@@ -49,15 +49,20 @@ const FAST_PAIR_MODELS: &[(u32, &str)] = &[
     (0x000280, "Xiaomi Buds 4 Pro"),
 ];
 
+/// Extract the 24-bit Fast Pair model ID from manufacturer data.
+pub fn model_id(data: &[u8]) -> Option<u32> {
+    if data.len() < 3 {
+        return None;
+    }
+    Some(((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32))
+}
+
 /// Look up a device name from Google Fast Pair manufacturer data.
 ///
 /// The manufacturer data for company 0x00E0 contains the model ID
 /// in its first 3 bytes (big-endian 24-bit value).
 pub fn lookup_model(data: &[u8]) -> Option<String> {
-    if data.len() < 3 {
-        return None;
-    }
-    let model_id = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
+    let model_id = model_id(data)?;
 
     FAST_PAIR_MODELS
         .iter()
@@ -65,9 +70,50 @@ pub fn lookup_model(data: &[u8]) -> Option<String> {
         .map(|(_, name)| name.to_string())
 }
 
+/// Best-effort vendor hint derived from a resolved Fast Pair model name.
+pub fn vendor_hint(model_name: &str) -> Option<&'static str> {
+    if model_name.starts_with("Pixel Buds") {
+        Some("Google")
+    } else if model_name.starts_with("Galaxy Buds") {
+        Some("Samsung")
+    } else if model_name.starts_with("Sony ") {
+        Some("Sony")
+    } else if model_name.starts_with("JBL ") {
+        Some("JBL")
+    } else if model_name.starts_with("Beats ") {
+        Some("Beats")
+    } else if model_name.starts_with("Nothing ") {
+        Some("Nothing")
+    } else if model_name.starts_with("Bose ") {
+        Some("Bose")
+    } else if model_name.starts_with("OnePlus ") {
+        Some("OnePlus")
+    } else if model_name.starts_with("Jabra ") {
+        Some("Jabra")
+    } else if model_name.starts_with("Anker ") {
+        Some("Anker")
+    } else if model_name.starts_with("Sennheiser ") {
+        Some("Sennheiser")
+    } else if model_name.starts_with("Xiaomi ") {
+        Some("Xiaomi")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_id_reads_three_byte_big_endian_value() {
+        assert_eq!(model_id(&[0x00, 0x01, 0x08]), Some(0x000108));
+    }
+
+    #[test]
+    fn model_id_requires_three_bytes() {
+        assert_eq!(model_id(&[0x00, 0x01]), None);
+    }
 
     #[test]
     fn lookup_pixel_buds() {
@@ -99,5 +145,12 @@ mod tests {
         // Extra bytes after the 3-byte model ID should be ignored
         let data = [0x00, 0x00, 0x47, 0xFF, 0xFF];
         assert_eq!(lookup_model(&data), Some("Pixel Buds".to_string()));
+    }
+
+    #[test]
+    fn vendor_hint_uses_model_prefix() {
+        assert_eq!(vendor_hint("Galaxy Buds2 Pro"), Some("Samsung"));
+        assert_eq!(vendor_hint("Bose QC Ultra Earbuds"), Some("Bose"));
+        assert_eq!(vendor_hint("Unknown Earbuds"), None);
     }
 }

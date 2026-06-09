@@ -6,8 +6,10 @@ mod classifier;
 mod config;
 mod continuity;
 mod db;
+mod eddystone;
 mod fast_pair;
 mod gatt;
+mod mqtt;
 mod scanner;
 mod service_uuids;
 mod tui;
@@ -28,7 +30,7 @@ use crossterm::terminal::{
 use db::PendingObs;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use scanner::ScanMessage;
+use scanner::{ScanMessage, ScanResult};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
@@ -169,6 +171,7 @@ async fn run(
     let scan_adapter = adapter.clone();
     let scan_secs = cli.scan_duration.unwrap_or(cfg.scan_duration);
     let scan_duration = Duration::from_secs(scan_secs);
+    let mqtt_publisher = mqtt::Publisher::new(&cfg.mqtt, adapter_index, scan_secs)?;
     tokio::spawn(async move {
         scanner::scan_loop(tx, scan_adapter, scan_duration).await;
     });
@@ -183,7 +186,7 @@ async fn run(
         gatt::probe_loop(probe_adapter, probe_req_rx, probe_res_tx).await;
     });
 
-    let mut pending_obs: HashMap<String, PendingObs> = HashMap::new();
+    let mut pending_results: HashMap<String, ScanResult> = HashMap::new();
 
     loop {
         terminal.draw(|f| tui::draw(f, &mut app))?;
@@ -225,11 +228,8 @@ async fn run(
                         KeyCode::Esc => app.cancel_api_key(),
                         KeyCode::Enter => {
                             if let Some(key_value) = app.save_api_key() {
-                                let _ = db::save_setting(
-                                    &conn,
-                                    "openai_api_key",
-                                    key_value.as_deref(),
-                                );
+                                let _ =
+                                    db::save_setting(&conn, "openai_api_key", key_value.as_deref());
                                 let message = if key_value.is_some() {
                                     "Saved OpenAI API key".to_string()
                                 } else {
@@ -364,31 +364,37 @@ async fn run(
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 ScanMessage::Result(result) => {
-                    pending_obs.insert(result.mac.clone(), PendingObs {
-                        mac: result.mac.clone(),
-                        rssi: result.rssi,
-                        name: result.name.clone(),
-                        service_uuids: result.service_uuids.join(","),
-                        fingerprint: app::effective_key(&result.fingerprint, &result.mac),
-                    });
+                    pending_results.insert(result.mac.clone(), result.clone());
                     app.upsert_device(result);
                 }
                 ScanMessage::CycleComplete => {
                     app.scan_count += 1;
-                    if !pending_obs.is_empty() {
+                    if !pending_results.is_empty() {
                         // Increment hourly cache for observed fingerprints
                         let hour = Local::now().hour() as usize;
                         let mut seen_fingerprints = HashSet::new();
-                        for obs in pending_obs.values() {
-                            let key = app::effective_key(&obs.fingerprint, &obs.mac);
+                        for result in pending_results.values() {
+                            let key = app::effective_key(&result.fingerprint, &result.mac);
                             if seen_fingerprints.insert(key.clone()) {
                                 let entry = app.hourly_cache.entry(key).or_insert([0u32; 24]);
                                 entry[hour] += 1;
                             }
                         }
+                        let cycle_seen_at = Local::now().to_rfc3339();
+                        let results: Vec<ScanResult> =
+                            pending_results.drain().map(|(_, result)| result).collect();
                         let observations: Vec<PendingObs> =
-                            pending_obs.drain().map(|(_, obs)| obs).collect();
-                        let _ = db::write_cycle(&conn, &app.devices, &observations);
+                            results.iter().map(PendingObs::from_scan_result).collect();
+                        let _ =
+                            db::write_cycle_at(&conn, &app.devices, &observations, &cycle_seen_at);
+                        if let Some(publisher) = mqtt_publisher.as_ref() {
+                            if let Err(err) = publisher
+                                .publish_scan_results(app.scan_count, &cycle_seen_at, &results)
+                                .await
+                            {
+                                eprintln!("Warning: failed to publish MQTT observations: {err}");
+                            }
+                        }
                     }
                     app.rebuild_sorted_list();
                 }
@@ -408,6 +414,11 @@ async fn run(
                     if let Some(d) = app.devices.get_mut(&mac) {
                         d.gatt_info = Some(info.clone());
                         let _ = db::update_gatt_info(&conn, &mac, &info);
+                    }
+                    if let Some(publisher) = mqtt_publisher.as_ref() {
+                        if let Err(err) = publisher.publish_gatt_observation(&mac, &info).await {
+                            eprintln!("Warning: failed to publish MQTT GATT observation: {err}");
+                        }
                     }
                     app.rebuild_sorted_list();
                 }
@@ -442,12 +453,9 @@ fn try_probe(app: &mut App) {
     };
     let mac = agg.representative_mac.clone();
     let now = Local::now();
-    let can_probe = app
-        .probe_cooldowns
-        .get(&fp)
-        .map_or(true, |last| {
-            now.signed_duration_since(*last).num_seconds() >= PROBE_COOLDOWN_SECS
-        });
+    let can_probe = app.probe_cooldowns.get(&fp).map_or(true, |last| {
+        now.signed_duration_since(*last).num_seconds() >= PROBE_COOLDOWN_SECS
+    });
     if can_probe {
         app.probe_cooldowns.insert(fp, now);
         app.probe_status = Some((format!("Probing {mac}..."), now));
@@ -490,7 +498,9 @@ fn export_view(app: &App, format: &str) -> String {
 }
 
 fn export_csv(devices: &[&app::AggregatedDevice]) -> anyhow::Result<String> {
-    let mut out = String::from("fingerprint,mac,name,vendor,type,rssi,distance,sightings,first_seen,last_seen,note\n");
+    let mut out = String::from(
+        "fingerprint,mac,name,vendor,type,rssi,distance,sightings,first_seen,last_seen,note\n",
+    );
     for d in devices {
         let name = d.name.as_deref().unwrap_or("").replace('"', "\"\"");
         let vendor = d.vendor.as_deref().unwrap_or("").replace('"', "\"\"");
@@ -499,9 +509,17 @@ fn export_csv(devices: &[&app::AggregatedDevice]) -> anyhow::Result<String> {
         let rssi = d.rssi.map(|r| r.to_string()).unwrap_or_default();
         out.push_str(&format!(
             "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"\n",
-            d.fingerprint, d.representative_mac, name, vendor,
-            d.device_type.label(), rssi, dist, d.sightings,
-            d.first_seen.to_rfc3339(), d.last_seen.to_rfc3339(), note,
+            d.fingerprint,
+            d.representative_mac,
+            name,
+            vendor,
+            d.device_type.label(),
+            rssi,
+            dist,
+            d.sightings,
+            d.first_seen.to_rfc3339(),
+            d.last_seen.to_rfc3339(),
+            note,
         ));
     }
     Ok(out)
@@ -533,8 +551,12 @@ fn export_json(devices: &[&app::AggregatedDevice]) -> anyhow::Result<String> {
 
 /// Load detail view data (RSSI history, hourly activity, rotation stats) from DB.
 fn load_detail_data(app: &mut App, conn: &rusqlite::Connection) {
-    let Some(idx) = app.table_state.selected() else { return };
-    let Some(fp) = app.display_list.get(idx) else { return };
+    let Some(idx) = app.table_state.selected() else {
+        return;
+    };
+    let Some(fp) = app.display_list.get(idx) else {
+        return;
+    };
     let macs: Vec<String> = app
         .fingerprint_groups
         .get(fp)

@@ -13,6 +13,7 @@ Interactive Bluetooth Low Energy (BLE) scanner with an htop-like terminal UI. Co
 - **Distance estimation** from RSSI / TX power / iBeacon calibrated power
 - **AI chat** (OpenAI) for querying scan data with natural language
 - **SQLite persistence** with observations table for time-series analysis
+- **Optional MQTT export** of raw scan and GATT observations for centralized processing
 - **Sortable/filterable table**, device detail popup, per-device notes
 - **Reference data CSVs** loaded into SQLite at startup for extensibility
 
@@ -48,7 +49,29 @@ sudo setcap cap_net_raw,cap_net_admin+eip target/release/bluemon-tui
 
 # Generate a template service_uuids.toml for custom UUID names
 ./target/release/bluemon-tui --init-service-uuids
+
+# Generate a config.toml template with MQTT options
+./target/release/bluemon-tui --init-config
 ```
+
+### MQTT Export
+
+Enable the optional MQTT publisher in `~/.config/bluemon-tui/config.toml`:
+
+```toml
+[mqtt]
+enabled = true
+host = "127.0.0.1"
+port = 1883
+topic_prefix = "bluemon"
+channel_name = "office"
+sensor_name = "collector-01"
+site_name = "hq"
+qos = 0
+retain = false
+```
+
+Messages publish to `bluemon/<channel_name>/<sensor_name>/observations` as JSON. The payload only includes factual collector output such as MAC, RSSI, TX power, service UUIDs, manufacturer data, device class, address type, and GATT probe results. Device classification and higher-level analysis are intentionally left to downstream consumers.
 
 ### AI Chat
 

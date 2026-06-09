@@ -5,7 +5,6 @@
 /// LE Audio, and common vendor-specific UUIDs.
 ///
 /// Users can override/extend via `~/.config/bluemon-tui/service_uuids.toml`.
-
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
